@@ -147,6 +147,84 @@ def _flash_to_shapely(prim):
 
 
 # ---------------------------------------------------------------------------
+#  Interactive polygon exclusion picker
+# ---------------------------------------------------------------------------
+
+def pick_exclude_polygons(polys, title="Click polygons to exclude, then close window"):
+    """Show all polygons interactively. Click to toggle exclude (red).
+    Close the window to confirm. Returns list of non-excluded polygons.
+
+    Args:
+        polys: list of Shapely Polygon/MultiPolygon geometries
+        title: window title
+
+    Returns:
+        filtered: list of polygons that were NOT excluded
+    """
+    from shapely.geometry import MultiPolygon, Polygon as ShapelyPolygon
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 9))
+    ax.set_aspect('equal')
+    ax.set_title(title)
+
+    # Track exclusion state per polygon index
+    excluded = set()
+    patch_map = {}  # matplotlib patch -> polygon index
+
+    # Draw each polygon as a clickable patch
+    for i, geom in enumerate(polys):
+        sub_polys = []
+        if isinstance(geom, MultiPolygon):
+            sub_polys = list(geom.geoms)
+        elif isinstance(geom, ShapelyPolygon):
+            sub_polys = [geom]
+        else:
+            continue
+
+        for sp in sub_polys:
+            x, y = sp.exterior.xy
+            patch = ax.fill(x, y, fc='darkorange', ec='gray', lw=0.5,
+                            alpha=0.7, picker=True)[0]
+            patch_map[patch] = i
+
+    ax.autoscale_view()
+
+    def on_pick(event):
+        patch = event.artist
+        if patch not in patch_map:
+            return
+        idx = patch_map[patch]
+
+        if idx in excluded:
+            # Re-include: back to orange
+            excluded.discard(idx)
+            for p, pidx in patch_map.items():
+                if pidx == idx:
+                    p.set_facecolor('darkorange')
+                    p.set_alpha(0.7)
+        else:
+            # Exclude: turn red + semi-transparent
+            excluded.add(idx)
+            for p, pidx in patch_map.items():
+                if pidx == idx:
+                    p.set_facecolor('red')
+                    p.set_alpha(0.3)
+
+        # Update count in title
+        ax.set_title(f"{title}  [excluded: {len(excluded)}/{len(polys)}]")
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect('pick_event', on_pick)
+    plt.show()
+
+    # Filter out excluded polygons
+    filtered = [p for i, p in enumerate(polys) if i not in excluded]
+    print(f"  Interactive selection: excluded {len(excluded)}, "
+          f"kept {len(filtered)}/{len(polys)} polygons")
+    return filtered
+
+
+# ---------------------------------------------------------------------------
 #  GerberLayer: parse a single .art/.gbr file
 # ---------------------------------------------------------------------------
 
@@ -157,6 +235,7 @@ class GerberLayer:
     name: str = ""
     merge_tolerance: float = 0.0
     no_merge: bool = False
+    interactive: bool = False
     _parsed: object = field(default=None, repr=False)
     _copper: object = field(default=None, repr=False)  # shapely geometry (merged)
     _copper_polys: list = field(default_factory=list, repr=False)  # individual polygons
@@ -223,6 +302,18 @@ class GerberLayer:
 
         # Store individual polygons (always needed for no_merge mode and bounds)
         self._copper_polys = polys
+
+        # --- INTERACTIVE EXCLUSION ---
+        if self.interactive:
+            print(f"  Opening interactive picker for {self.name} ...")
+            print(f"  Click polygons to exclude (they turn red), then close the window.")
+            self._copper_polys = pick_exclude_polygons(
+                self._copper_polys,
+                title=f"{self.name}: click to exclude, then close window",
+            )
+            polys = self._copper_polys
+            if not polys:
+                raise ValueError(f"All polygons excluded for {self.filepath}")
 
         if self.no_merge:
             # --- NO MERGE MODE ---
@@ -608,7 +699,7 @@ def compute_shared_bounds(layers: List[GerberLayer]):
 def process_layers(filepaths: List[str], nx=20, ny=20,
                    bounds=None, shared_bounds=True,
                    export_csv=True, plot=True, show=False, outdir=None,
-                   merge_tolerance=0.0, no_merge=False):
+                   merge_tolerance=0.0, no_merge=False, interactive=False):
     """
     Process multiple Gerber layer files.
 
@@ -634,7 +725,8 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         try:
             layer = GerberLayer(filepath=fp,
                                 merge_tolerance=merge_tolerance,
-                                no_merge=no_merge)
+                                no_merge=no_merge,
+                                interactive=interactive)
             layer.load()
             layer.to_polygons()
             layers.append(layer)
@@ -739,6 +831,10 @@ def main():
     parser.add_argument('--no-plot', action='store_true', help='Skip plot generation')
     parser.add_argument('--no-csv', action='store_true', help='Skip CSV export')
     parser.add_argument('--show', action='store_true', help='Display plots interactively')
+    parser.add_argument('--interactive', action='store_true',
+                        help='Open interactive picker to visually exclude polygons '
+                             'before merge. Click polygons to exclude (turn red), '
+                             'then close the window to proceed.')
 
     # --- New merge resolution controls ---
     merge_group = parser.add_argument_group(
@@ -783,6 +879,7 @@ def main():
         outdir=args.outdir,
         merge_tolerance=args.merge_tolerance,
         no_merge=args.no_merge,
+        interactive=args.interactive,
     )
 
     if args.show:

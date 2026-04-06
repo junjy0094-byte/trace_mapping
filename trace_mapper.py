@@ -739,10 +739,54 @@ def plot_fraction_map(mapper: TraceGridMapper, ax=None, cmap='YlOrRd',
     return ax
 
 
+def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
+                        color='darkorange'):
+    """Show even-odd copper result derived from already-computed fractions.
+
+    Uses the mapper.fractions grid (product of even-odd per-cell computation)
+    to display which cells are filled vs empty.  Cells with fraction > 0 are
+    copper; cells with fraction == 0 are empty (background or even-overlap hole).
+    """
+    import matplotlib.colors as mcolors
+
+    if ax is None:
+        _, ax = plt.subplots(1, 1, figsize=(10, 8))
+
+    if mapper.fractions is None:
+        mapper.compute()
+
+    info = mapper.grid_info
+    extent = [info['xmin'], info['xmax'], info['ymin'], info['ymax']]
+
+    # Build two-color image: copper color where fraction > 0, white elsewhere.
+    r, g, b, _ = mcolors.to_rgba(color)
+    rgba = np.ones((*mapper.fractions.shape, 4))  # white background
+    mask = mapper.fractions > 0
+    rgba[mask] = [r, g, b, 0.85]       # filled cells → copper color
+    rgba[~mask] = [1.0, 1.0, 1.0, 1.0]  # empty cells  → white
+
+    ax.imshow(rgba, origin='lower', extent=extent, aspect='equal',
+              interpolation='nearest')
+    ax.set_aspect('equal')
+    ax.set_title(f"Cu even-odd: {layer_name}  ({mapper.nx}×{mapper.ny} grid)")
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    return ax
+
+
 def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
-    """Side-by-side: raw copper vs fraction heatmap."""
+    """Side-by-side: copper view vs fraction heatmap.
+
+    Left panel:
+      - even-odd mode: shows even-odd fill result (holes visible)
+      - other modes  : shows raw copper polygons
+    Right panel: copper fraction heatmap.
+    """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    plot_copper(layer, ax=ax1)
+    if mapper.even_odd:
+        plot_evenodd_copper(mapper, layer_name=layer.name, ax=ax1)
+    else:
+        plot_copper(layer, ax=ax1)
     plot_fraction_map(mapper, ax=ax2, title=f"{layer.name} -- Grid Mapping")
     fig.tight_layout()
     return fig

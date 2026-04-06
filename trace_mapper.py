@@ -27,6 +27,27 @@ import argparse
 import time
 
 # ---------------------------------------------------------------------------
+#  Polygon merging helpers
+# ---------------------------------------------------------------------------
+
+def _even_odd_union(polys):
+    """Merge polygons using even-odd fill rule (XOR accumulation).
+
+    Areas covered by an odd number of polygons are filled.
+    Areas covered by an even number of polygons become holes.
+
+    - 1 overlap : filled  (normal shape)
+    - 2 overlaps: empty   (hollow interior - e.g. big rect + small rect = hole)
+    - 3+ overlaps: filled (patterns drawn inside hollow areas)
+    """
+    from shapely.geometry import GeometryCollection
+    result = GeometryCollection()
+    for poly in polys:
+        result = result.symmetric_difference(poly)
+    return result
+
+
+# ---------------------------------------------------------------------------
 #  Gerber -> Shapely polygon conversion helpers
 # ---------------------------------------------------------------------------
 
@@ -262,7 +283,6 @@ class GerberLayer:
         - merge_tolerance == 0 (default): standard unary_union with full precision.
         """
         import gerber.primitives as gp
-        from shapely.ops import unary_union
 
         if self._parsed is None:
             self.load()
@@ -348,7 +368,7 @@ class GerberLayer:
                 snapped = polys
 
             t0 = time.time()
-            self._copper = unary_union(snapped)
+            self._copper = _even_odd_union(snapped)
             print(f"done ({time.time()-t0:.1f}s)")
 
         return self._copper if self._copper is not None else self._copper_polys

@@ -607,7 +607,7 @@ def compute_shared_bounds(layers: List[GerberLayer]):
 
 def process_layers(filepaths: List[str], nx=20, ny=20,
                    bounds=None, shared_bounds=True,
-                   export_csv=True, plot=True, outdir=None,
+                   export_csv=True, plot=True, show=False, outdir=None,
                    merge_tolerance=0.0, no_merge=False):
     """
     Process multiple Gerber layer files.
@@ -689,7 +689,8 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
             fig = plot_comparison(layer, mapper)
             png_path = out_base / f"{stem}.png"
             fig.savefig(str(png_path), dpi=150, bbox_inches='tight')
-            plt.close(fig)
+            if not show:
+                plt.close(fig)
             print(f"Plot saved: {png_path}")
 
         results[layer.name] = mapper
@@ -713,7 +714,8 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         summary_path = (Path(outdir) if outdir
                         else Path(layers[0].filepath).parent) / "all_layers_summary.png"
         fig.savefig(str(summary_path), dpi=150, bbox_inches='tight')
-        plt.close(fig)
+        if not show:
+            plt.close(fig)
         print(f"Summary plot saved: {summary_path}")
 
     return results
@@ -777,6 +779,7 @@ def main():
         shared_bounds=not args.no_shared_bounds,
         export_csv=not args.no_csv,
         plot=not args.no_plot,
+        show=args.show,
         outdir=args.outdir,
         merge_tolerance=args.merge_tolerance,
         no_merge=args.no_merge,

@@ -403,7 +403,7 @@ class TraceGridMapper:
 
                 total_area = 0.0
                 for idx in candidates:
-                    if isinstance(idx, int):
+                    if isinstance(idx, (int, np.integer)):
                         poly = self.copper_polys[idx]
                     else:
                         poly = idx  # Shapely < 2.0 returns geometries directly

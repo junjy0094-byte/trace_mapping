@@ -430,166 +430,86 @@ class TraceGridMapper:
             else:
                 raise ValueError("Either copper or copper_polys must be provided")
 
-    def _compute_merged(self):
-        """Compute fractions using merged copper geometry (original approach)."""
-        from shapely.geometry import box
-        from shapely import prepared
+    def _compute_raster(self, mode):
+        """Fast grid computation using point-sampling rasterisation.
 
-        xmin, ymin, xmax, ymax = self.bounds
-        dx = (xmax - xmin) / self.nx
-        dy = (ymax - ymin) / self.ny
-        cell_area = dx * dy
+        Instead of expensive Shapely polygon-polygon intersection per cell,
+        creates a fine sub-pixel grid and tests point-in-polygon with
+        matplotlib Path (C-optimised).  The sub-pixel bitmap is then
+        block-averaged to produce the per-cell copper fraction.
 
-        self.fractions = np.zeros((self.ny, self.nx), dtype=np.float64)
-        prep_copper = prepared.prep(self.copper)
-
-        for j in range(self.ny):
-            for i in range(self.nx):
-                x0 = xmin + i * dx
-                y0 = ymin + j * dy
-                cell = box(x0, y0, x0 + dx, y0 + dy)
-
-                if not prep_copper.intersects(cell):
-                    continue
-                if prep_copper.contains(cell):
-                    self.fractions[j, i] = 1.0
-                    continue
-                intersection = self.copper.intersection(cell)
-                self.fractions[j, i] = intersection.area / cell_area
-
-    def _compute_individual(self):
-        """Compute fractions using individual polygons with STRtree spatial index.
-
-        This avoids unary_union entirely, so fine traces that are geometrically
-        separate remain separate. Each cell's fraction is computed by summing
-        intersection areas of all polygons that touch that cell, then clamping
-        to [0, 1] to handle any overlaps.
+        mode: 'even-odd' | 'merged' | 'individual'
         """
-        from shapely.geometry import box
-        from shapely import strtree
+        from matplotlib.path import Path as MplPath
+        from shapely.geometry import Polygon as SP, MultiPolygon as MP
 
+        SUB = 5                               # sub-samples per cell per axis
         xmin, ymin, xmax, ymax = self.bounds
-        dx = (xmax - xmin) / self.nx
-        dy = (ymax - ymin) / self.ny
-        cell_area = dx * dy
+        nx_s, ny_s = self.nx * SUB, self.ny * SUB
+        sx = (xmax - xmin) / nx_s
+        sy = (ymax - ymin) / ny_s
 
-        self.fractions = np.zeros((self.ny, self.nx), dtype=np.float64)
+        # Centre of each sub-pixel
+        xs = xmin + (np.arange(nx_s) + 0.5) * sx
+        ys = ymin + (np.arange(ny_s) + 0.5) * sy
 
-        # Build spatial index over copper polygons
-        tree = strtree.STRtree(self.copper_polys)
+        if mode == "even-odd":
+            grid = np.zeros((ny_s, nx_s), dtype=np.int32)
+        else:
+            grid = np.zeros((ny_s, nx_s), dtype=np.bool_)
 
-        for j in range(self.ny):
-            for i in range(self.nx):
-                x0 = xmin + i * dx
-                y0 = ymin + j * dy
-                cell = box(x0, y0, x0 + dx, y0 + dy)
+        # Collect source polygon list
+        if mode == "merged":
+            src = [self.copper]
+        else:
+            src = self.copper_polys
 
-                # Query spatial index for candidate polygons
-                try:
-                    # Shapely >= 2.0 API
-                    candidates = tree.query(cell)
-                except TypeError:
-                    # Shapely < 2.0 API
-                    candidates = tree.query(cell)
+        n_src = len(src)
+        for k, geom in enumerate(src):
+            if n_src > 200 and (k + 1) % 500 == 0:
+                print(f"    rasterising {k+1}/{n_src} polygons ...", flush=True)
 
-                if len(candidates) == 0:
+            # Expand to simple Polygon objects
+            if isinstance(geom, MP):
+                simple = list(geom.geoms)
+            elif isinstance(geom, SP):
+                simple = [geom]
+            else:
+                continue
+
+            for sp in simple:
+                if sp.is_empty:
+                    continue
+                pxmin, pymin, pxmax, pymax = sp.bounds
+                c0 = max(0, int((pxmin - xmin) / sx))
+                c1 = min(nx_s, int(np.ceil((pxmax - xmin) / sx)))
+                r0 = max(0, int((pymin - ymin) / sy))
+                r1 = min(ny_s, int(np.ceil((pymax - ymin) / sy)))
+                if c0 >= c1 or r0 >= r1:
                     continue
 
-                total_area = 0.0
-                for idx in candidates:
-                    if isinstance(idx, (int, np.integer)):
-                        poly = self.copper_polys[idx]
-                    else:
-                        poly = idx  # Shapely < 2.0 returns geometries directly
+                gx, gy = np.meshgrid(xs[c0:c1], ys[r0:r1])
+                pts = np.column_stack([gx.ravel(), gy.ravel()])
 
-                    if poly.contains(cell):
-                        total_area = cell_area
-                        break
-                    intersection = poly.intersection(cell)
-                    if not intersection.is_empty:
-                        total_area += intersection.area
+                inside = MplPath(np.array(sp.exterior.coords)).contains_points(pts)
+                for ring in sp.interiors:
+                    inside &= ~MplPath(np.array(ring.coords)).contains_points(pts)
 
-                # Clamp to 1.0 (overlapping polygons could exceed cell_area)
-                self.fractions[j, i] = min(total_area / cell_area, 1.0)
-
-    def _compute_evenodd(self):
-        """Compute fractions using even-odd fill rule per cell.
-
-        For each cell, count how many polygons cover each point:
-          - Odd count  → filled  (1 layer, 3+ layers)
-          - Even count → empty   (2-layer hollow interior)
-
-        Algorithm (fast path for interior cells):
-          1. Polygons fully containing the cell contribute to a parity counter
-             (no geometry ops needed).
-          2. Polygons partially intersecting the cell are XOR'd geometrically
-             within the cell.
-          3. If the parity counter is odd, start from the full cell; otherwise
-             start from empty. Then apply the partial XORs.
-
-        This allows hollow shapes: drawing a big rect + small rect inside
-        produces a hole (2 overlaps = even = empty), while patterns inside
-        the hole (3 overlaps = odd = filled) stay filled.
-        """
-        from shapely.geometry import box, GeometryCollection
-        from shapely import strtree, prepared
-
-        xmin, ymin, xmax, ymax = self.bounds
-        dx = (xmax - xmin) / self.nx
-        dy = (ymax - ymin) / self.ny
-        cell_area = dx * dy
-
-        self.fractions = np.zeros((self.ny, self.nx), dtype=np.float64)
-
-        # Build spatial index and prepared geometries for fast contains()
-        tree = strtree.STRtree(self.copper_polys)
-        prep_polys = [prepared.prep(p) for p in self.copper_polys]
-
-        for j in range(self.ny):
-            for i in range(self.nx):
-                x0 = xmin + i * dx
-                y0 = ymin + j * dy
-                cell = box(x0, y0, x0 + dx, y0 + dy)
-
-                try:
-                    candidates = tree.query(cell)
-                except TypeError:
-                    candidates = tree.query(cell)
-
-                if len(candidates) == 0:
-                    continue
-
-                # Separate fully-containing polygons (fast path) from partial ones
-                contain_count = 0
-                partial_geoms = []
-
-                for idx in candidates:
-                    if isinstance(idx, (int, np.integer)):
-                        poly = self.copper_polys[idx]
-                        prep = prep_polys[idx]
-                    else:
-                        poly = idx
-                        prep = prepared.prep(poly)
-
-                    if prep.contains(cell):
-                        # Full containment: no geometry needed, just track parity
-                        contain_count += 1
-                    else:
-                        inter = poly.intersection(cell)
-                        if not inter.is_empty:
-                            partial_geoms.append(inter)
-
-                # Start from full cell (odd parity) or empty (even parity),
-                # then XOR each partial intersection
-                if contain_count % 2 == 1:
-                    result = cell  # odd containing polys → starts filled
+                mask = inside.reshape(r1 - r0, c1 - c0)
+                if mode == "even-odd":
+                    grid[r0:r1, c0:c1] += mask
                 else:
-                    result = GeometryCollection()  # even → starts empty
+                    grid[r0:r1, c0:c1] |= mask
 
-                for geom in partial_geoms:
-                    result = result.symmetric_difference(geom)
+        # Collapse sub-pixels → grid cells
+        if mode == "even-odd":
+            sampled = (grid % 2 == 1).astype(np.float64)
+        else:
+            sampled = grid.astype(np.float64)
 
-                self.fractions[j, i] = result.area / cell_area
+        self.fractions = sampled.reshape(
+            self.ny, SUB, self.nx, SUB
+        ).mean(axis=(1, 3))
 
     def compute(self):
         """Compute copper fraction for each grid cell."""
@@ -618,12 +538,7 @@ class TraceGridMapper:
               flush=True)
         t0 = time.time()
 
-        if mode == "even-odd":
-            self._compute_evenodd()
-        elif mode == "merged":
-            self._compute_merged()
-        else:
-            self._compute_individual()
+        self._compute_raster(mode)
 
         elapsed = time.time() - t0
         nonzero = np.count_nonzero(self.fractions)
@@ -851,12 +766,15 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         return {}
 
     # --- Step 1: Load & parse all layers ---
+    # When even_odd mode is active we only need individual polygons,
+    # so skip the expensive unary_union merge entirely.
+    skip_merge = no_merge or even_odd
     layers: List[GerberLayer] = []
     for fp in filepaths:
         try:
             layer = GerberLayer(filepath=fp,
                                 merge_tolerance=merge_tolerance,
-                                no_merge=no_merge,
+                                no_merge=skip_merge,
                                 interactive=interactive)
             layer.load()
             layer.to_polygons()

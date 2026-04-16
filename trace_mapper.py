@@ -762,6 +762,44 @@ def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
     return fig
 
 
+def save_grid_debug_images(layer: GerberLayer, mapper: TraceGridMapper, out_dir: Path):
+    """Save per-grid-cell debug PNGs used for density inspection.
+
+    For each (ix, iy) cell, saves a zoomed image of original Gerber Cu geometry
+    clipped to that cell extent, with the cell fraction in the title.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    info = mapper.grid_info
+    dx, dy = info['dx'], info['dy']
+    xmin, ymin = info['xmin'], info['ymin']
+    design_geom = _get_design_copper_geometry(layer)
+
+    total = mapper.nx * mapper.ny
+    print(f"Saving grid debug images: {total} cells -> {out_dir}")
+
+    for j in range(mapper.ny):
+        y0 = ymin + j * dy
+        y1 = y0 + dy
+        for i in range(mapper.nx):
+            x0 = xmin + i * dx
+            x1 = x0 + dx
+            frac = mapper.fractions[j, i]
+
+            fig, ax = plt.subplots(1, 1, figsize=(3, 3))
+            plot_copper(design_geom, layer_name="", ax=ax)
+            ax.set_xlim(x0, x1)
+            ax.set_ylim(y0, y1)
+            ax.set_title(f"{layer.name} cell ({i},{j})  frac={frac:.4f}")
+            ax.set_xlabel("")
+            ax.set_ylabel("")
+
+            cell_png = out_dir / f"cell_y{j:03d}_x{i:03d}.png"
+            fig.savefig(str(cell_png), dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+    print(f"Saved grid debug images: {out_dir}")
+
+
 # ---------------------------------------------------------------------------
 #  Multi-layer batch processing
 # ---------------------------------------------------------------------------
@@ -802,7 +840,7 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                    bounds=None, shared_bounds=True,
                    export_csv=True, plot=True, show=False, outdir=None,
                    merge_tolerance=0.0, no_merge=False, interactive=False,
-                   even_odd=True):
+                   even_odd=True, debug_grid_images=False):
     """
     Process multiple Gerber layer files.
 
@@ -818,6 +856,9 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         even_odd: If True (default), apply even-odd fill rule per cell.
                   Odd overlaps = filled, even overlaps = empty (hollow interior).
                   Enables hollow shapes: big rect + small rect inside = hole.
+        debug_grid_images: If True, save one PNG per grid cell showing
+                           original Gerber Cu clipped to the cell and the
+                           computed density fraction.
     Returns:
         dict: {layer_name: TraceGridMapper}
     """
@@ -901,6 +942,10 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
             if not show:
                 plt.close(fig)
             print(f"Plot saved: {png_path}")
+
+        if debug_grid_images:
+            dbg_dir = out_base / f"{stem}_grid_debug"
+            save_grid_debug_images(layer, mapper, dbg_dir)
 
         results[layer.name] = mapper
 
@@ -1213,6 +1258,10 @@ def main():
     parser.add_argument('--no-plot', action='store_true', help='Skip plot generation')
     parser.add_argument('--no-csv', action='store_true', help='Skip CSV export')
     parser.add_argument('--show', action='store_true', help='Display plots interactively')
+    parser.add_argument(
+        '--debug-grid-images', action='store_true',
+        help='Save per-grid-cell debug PNGs (one image per cell) showing '
+             'Gerber Cu clipped to each cell with computed fraction.')
     parser.add_argument('--interactive', action='store_true',
                         help='Open interactive picker to visually exclude polygons '
                              'before merge. Click polygons to exclude (turn red), '
@@ -1277,6 +1326,7 @@ def main():
         no_merge=args.no_merge,
         interactive=args.interactive,
         even_odd=use_even_odd,
+        debug_grid_images=args.debug_grid_images,
     )
 
     if args.show:

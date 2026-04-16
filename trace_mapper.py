@@ -414,6 +414,7 @@ class TraceGridMapper:
     bounds: Optional[Tuple[float, float, float, float]] = None
     even_odd: bool = False
     fractions: np.ndarray = field(default=None, repr=False)
+    raster: np.ndarray = field(default=None, repr=False)
 
     def __post_init__(self):
         if self.bounds is None:
@@ -507,6 +508,8 @@ class TraceGridMapper:
             sampled = ((grid > 0) & (grid != 2)).astype(np.float64)
         else:
             sampled = grid.astype(np.float64)
+
+        self.raster = sampled
 
         self.fractions = sampled.reshape(
             self.ny, SUB, self.nx, SUB
@@ -690,134 +693,34 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
     return ax
 
 
-def _xor_union(polys):
-    """Standard XOR (symmetric_difference) of all polygons.
-
-    Divide-and-conquer to keep intermediate results simple.
-    """
-    from shapely.geometry import Polygon as SP, MultiPolygon as MP, GeometryCollection
-    from shapely.ops import unary_union
-
-    n = len(polys)
-    if n == 0:
-        return SP()
-    if n == 1:
-        return polys[0]
-
-    mid = n // 2
-    left = _xor_union(polys[:mid])
-    right = _xor_union(polys[mid:])
-    result = left.symmetric_difference(right)
-
-    if isinstance(result, GeometryCollection) and not isinstance(result, (SP, MP)):
-        poly_parts = [g for g in result.geoms if isinstance(g, SP)]
-        if not poly_parts:
-            return SP()
-        return unary_union(poly_parts)
-    return result
-
-
-def _even_odd_union(polys):
-    """Custom fill rule: 1=filled, 2=empty, 3+=always filled.
-
-    Equivalent to: full_union minus areas_with_exactly_2_overlaps.
-    Steps:
-      1. XOR  → areas with odd overlap count (1, 3, 5 …)
-      2. union - XOR → areas with even overlap count (2, 4, 6 …)
-      3. Among even-overlap areas, add back those with count >= 4
-         (sample representative point, count containing polygons)
-      4. Result = XOR + added-back areas
-    """
-    from shapely.geometry import Polygon as SP, MultiPolygon as MP
-    from shapely.ops import unary_union
-
-    if not polys:
-        return SP()
-    if len(polys) == 1:
-        return polys[0]
-
-    full_union = unary_union(polys)
-    xor_result = _xor_union(polys)
-
-    # even_holes = areas where overlap count is even (2, 4, 6 …)
-    even_holes = full_union.difference(xor_result)
-    if even_holes.is_empty:
-        return xor_result
-
-    # Separate hole polygons and check overlap count
-    if isinstance(even_holes, MP):
-        hole_parts = list(even_holes.geoms)
-    elif isinstance(even_holes, SP):
-        hole_parts = [even_holes]
-    else:
-        hole_parts = [g for g in even_holes.geoms if isinstance(g, SP)]
-
-    # Add back hole regions with count >= 4 (they should be filled)
-    add_back = []
-    for hole in hole_parts:
-        if hole.is_empty or hole.area <= 0:
-            continue
-        pt = hole.representative_point()
-        count = sum(1 for p in polys if p.contains(pt))
-        if count >= 3:
-            add_back.append(hole)
-
-    if add_back:
-        return unary_union([xor_result] + add_back)
-    return xor_result
-
-
 def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
-    """Side-by-side: even-odd copper with grid overlay vs fraction heatmap.
+    """Side-by-side: even-odd processed copper vs fraction heatmap.
 
-    Left panel : copper polygons refined by even-odd fill (gold) with grid
+    Left panel : sub-pixel raster from density computation (gold/white)
+                 with NxM grid overlay.  Uses the same custom fill rule
+                 (1=fill, 2=empty, 3+=fill) already applied in the raster.
     Right panel: copper fraction heatmap (grid mapping result)
     """
-    from shapely.geometry import MultiPolygon, Polygon as ShapelyPolygon
+    import matplotlib.colors as mcolors
 
-    if mapper.fractions is None:
+    if mapper.raster is None:
         mapper.compute()
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
 
-    # --- Left panel: even-odd refined polygons + grid overlay ---
-    # Collect source polygons
-    if layer.copper is not None:
-        geom = layer.copper
-        if isinstance(geom, MultiPolygon):
-            polys = list(geom.geoms)
-        else:
-            polys = [geom]
-    else:
-        polys = layer.copper_polys or []
-
-    # Apply even-odd fill (XOR) when mapper uses even-odd mode
-    if mapper.even_odd and polys:
-        refined = _even_odd_union(polys)
-    else:
-        refined = polys  # no even-odd; keep as-is
-
-    # Normalise to list of Polygons
-    if isinstance(refined, (MultiPolygon,)):
-        draw_polys = list(refined.geoms)
-    elif isinstance(refined, ShapelyPolygon):
-        draw_polys = [refined]
-    elif isinstance(refined, list):
-        draw_polys = refined
-    else:
-        draw_polys = []
-
-    for poly in draw_polys:
-        if not isinstance(poly, ShapelyPolygon) or poly.is_empty:
-            continue
-        x, y = poly.exterior.xy
-        ax1.fill(x, y, fc='gold', ec='none', alpha=0.9)
-        for interior in poly.interiors:
-            ix, iy = interior.xy
-            ax1.fill(ix, iy, fc='white', ec='none', alpha=1.0)
-
-    # Draw grid lines on top
     info = mapper.grid_info
+    extent = [info['xmin'], info['xmax'], info['ymin'], info['ymax']]
+
+    # --- Left panel: raster copper image + grid overlay ---
+    r, g, b, _ = mcolors.to_rgba('gold')
+    rgba = np.ones((*mapper.raster.shape, 4))
+    mask = mapper.raster > 0
+    rgba[mask] = [r, g, b, 1.0]
+    rgba[~mask] = [1.0, 1.0, 1.0, 1.0]
+
+    ax1.imshow(rgba, origin='lower', extent=extent, aspect='equal',
+               interpolation='nearest')
+
     for i in range(mapper.nx + 1):
         x = info['xmin'] + i * info['dx']
         ax1.axvline(x, color='gray', lw=0.3, alpha=0.5)
@@ -825,8 +728,6 @@ def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
         y = info['ymin'] + j * info['dy']
         ax1.axhline(y, color='gray', lw=0.3, alpha=0.5)
 
-    ax1.set_xlim(info['xmin'], info['xmax'])
-    ax1.set_ylim(info['ymin'], info['ymax'])
     ax1.set_aspect('equal')
     ax1.set_title(f"Copper: {layer.name}  ({mapper.nx}×{mapper.ny} grid)")
     ax1.set_xlabel('X')

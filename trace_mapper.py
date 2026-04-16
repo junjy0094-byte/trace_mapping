@@ -689,10 +689,42 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
     return ax
 
 
-def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
-    """Side-by-side: copper polygons with grid overlay vs fraction heatmap.
+def _even_odd_union(polys):
+    """Compute even-odd fill result from a list of polygons.
 
-    Left panel : original copper polygons (gold) with NxM grid lines
+    Uses symmetric_difference (XOR) which is associative/commutative:
+    areas covered by an odd number of polygons are filled,
+    areas covered by an even number become holes.
+    Divide-and-conquer to keep intermediate results simple.
+    """
+    from shapely.geometry import Polygon as SP, MultiPolygon as MP, GeometryCollection
+    from shapely.ops import unary_union
+
+    n = len(polys)
+    if n == 0:
+        return SP()
+    if n == 1:
+        return polys[0]
+
+    mid = n // 2
+    left = _even_odd_union(polys[:mid])
+    right = _even_odd_union(polys[mid:])
+    result = left.symmetric_difference(right)
+
+    # symmetric_difference can return GeometryCollection with stray
+    # lines/points; keep only Polygon parts.
+    if isinstance(result, GeometryCollection) and not isinstance(result, (SP, MP)):
+        poly_parts = [g for g in result.geoms if isinstance(g, SP)]
+        if not poly_parts:
+            return SP()
+        return unary_union(poly_parts)
+    return result
+
+
+def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
+    """Side-by-side: even-odd copper with grid overlay vs fraction heatmap.
+
+    Left panel : copper polygons refined by even-odd fill (gold) with grid
     Right panel: copper fraction heatmap (grid mapping result)
     """
     from shapely.geometry import MultiPolygon, Polygon as ShapelyPolygon
@@ -702,8 +734,8 @@ def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
 
-    # --- Left panel: original polygons + grid overlay ---
-    # Draw copper polygons
+    # --- Left panel: even-odd refined polygons + grid overlay ---
+    # Collect source polygons
     if layer.copper is not None:
         geom = layer.copper
         if isinstance(geom, MultiPolygon):
@@ -711,10 +743,26 @@ def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
         else:
             polys = [geom]
     else:
-        polys = layer.copper_polys
+        polys = layer.copper_polys or []
 
-    for poly in polys:
-        if not isinstance(poly, ShapelyPolygon):
+    # Apply even-odd fill (XOR) when mapper uses even-odd mode
+    if mapper.even_odd and polys:
+        refined = _even_odd_union(polys)
+    else:
+        refined = polys  # no even-odd; keep as-is
+
+    # Normalise to list of Polygons
+    if isinstance(refined, (MultiPolygon,)):
+        draw_polys = list(refined.geoms)
+    elif isinstance(refined, ShapelyPolygon):
+        draw_polys = [refined]
+    elif isinstance(refined, list):
+        draw_polys = refined
+    else:
+        draw_polys = []
+
+    for poly in draw_polys:
+        if not isinstance(poly, ShapelyPolygon) or poly.is_empty:
             continue
         x, y = poly.exterior.xy
         ax1.fill(x, y, fc='gold', ec='none', alpha=0.9)

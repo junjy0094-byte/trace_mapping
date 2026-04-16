@@ -414,6 +414,7 @@ class TraceGridMapper:
     bounds: Optional[Tuple[float, float, float, float]] = None
     even_odd: bool = False
     fractions: np.ndarray = field(default=None, repr=False)
+    raster: np.ndarray = field(default=None, repr=False)
 
     def __post_init__(self):
         if self.bounds is None:
@@ -506,6 +507,9 @@ class TraceGridMapper:
             sampled = (grid % 2 == 1).astype(np.float64)
         else:
             sampled = grid.astype(np.float64)
+
+        # Keep full-resolution raster for visualisation
+        self.raster = sampled
 
         self.fractions = sampled.reshape(
             self.ny, SUB, self.nx, SUB
@@ -689,35 +693,37 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
     return ax
 
 
-def plot_grid_copper(mapper: TraceGridMapper, layer_name="", ax=None):
-    """Plot grid-based binary copper map.
+def plot_grid_copper(mapper: TraceGridMapper, layer_name="", ax=None,
+                     color='gold'):
+    """Plot the high-resolution rasterised copper with grid overlay.
 
-    Each grid cell is coloured yellow (gold) when it contains copper
-    (fraction > 0) and white otherwise.  Grid lines are drawn so that
-    individual cells are visible.
+    Displays the full sub-pixel raster produced during computation
+    (after even-odd or union processing) so that the actual copper
+    shapes are visible at high fidelity.  The NxM grid lines are drawn
+    on top to show how the area is partitioned for density calculation.
     """
     import matplotlib.colors as mcolors
 
     if ax is None:
         _, ax = plt.subplots(1, 1, figsize=(10, 8))
 
-    if mapper.fractions is None:
+    if mapper.raster is None:
         mapper.compute()
 
     info = mapper.grid_info
     extent = [info['xmin'], info['xmax'], info['ymin'], info['ymax']]
 
-    # Build RGBA image: gold where Cu, white elsewhere
-    r, g, b, _ = mcolors.to_rgba('gold')
-    rgba = np.ones((*mapper.fractions.shape, 4))  # white background
-    mask = mapper.fractions > 0
-    rgba[mask] = [r, g, b, 1.0]
-    rgba[~mask] = [1.0, 1.0, 1.0, 1.0]
+    # Build RGBA image from the high-res raster
+    r, g, b, _ = mcolors.to_rgba(color)
+    rgba = np.ones((*mapper.raster.shape, 4))  # white background
+    mask = mapper.raster > 0
+    rgba[mask] = [r, g, b, 1.0]       # copper pixels → gold/yellow
+    rgba[~mask] = [1.0, 1.0, 1.0, 1.0]  # empty pixels  → white
 
     ax.imshow(rgba, origin='lower', extent=extent, aspect='equal',
               interpolation='nearest')
 
-    # Draw grid lines
+    # Overlay NxM grid lines
     for i in range(mapper.nx + 1):
         x = info['xmin'] + i * info['dx']
         ax.axvline(x, color='gray', lw=0.3, alpha=0.5)
@@ -726,7 +732,7 @@ def plot_grid_copper(mapper: TraceGridMapper, layer_name="", ax=None):
         ax.axhline(y, color='gray', lw=0.3, alpha=0.5)
 
     ax.set_aspect('equal')
-    ax.set_title(f"Cu Grid: {layer_name}  ({mapper.nx}×{mapper.ny})")
+    ax.set_title(f"Cu Raster: {layer_name}  ({mapper.nx}×{mapper.ny} grid)")
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     return ax

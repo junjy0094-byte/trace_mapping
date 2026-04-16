@@ -689,14 +689,57 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
     return ax
 
 
-def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
-    """Side-by-side: raw copper artwork vs fraction heatmap.
+def plot_grid_copper(mapper: TraceGridMapper, layer_name="", ax=None):
+    """Plot grid-based binary copper map.
 
-    Left panel : raw copper polygons from the art file
+    Each grid cell is coloured yellow (gold) when it contains copper
+    (fraction > 0) and white otherwise.  Grid lines are drawn so that
+    individual cells are visible.
+    """
+    import matplotlib.colors as mcolors
+
+    if ax is None:
+        _, ax = plt.subplots(1, 1, figsize=(10, 8))
+
+    if mapper.fractions is None:
+        mapper.compute()
+
+    info = mapper.grid_info
+    extent = [info['xmin'], info['xmax'], info['ymin'], info['ymax']]
+
+    # Build RGBA image: gold where Cu, white elsewhere
+    r, g, b, _ = mcolors.to_rgba('gold')
+    rgba = np.ones((*mapper.fractions.shape, 4))  # white background
+    mask = mapper.fractions > 0
+    rgba[mask] = [r, g, b, 1.0]
+    rgba[~mask] = [1.0, 1.0, 1.0, 1.0]
+
+    ax.imshow(rgba, origin='lower', extent=extent, aspect='equal',
+              interpolation='nearest')
+
+    # Draw grid lines
+    for i in range(mapper.nx + 1):
+        x = info['xmin'] + i * info['dx']
+        ax.axvline(x, color='gray', lw=0.3, alpha=0.5)
+    for j in range(mapper.ny + 1):
+        y = info['ymin'] + j * info['dy']
+        ax.axhline(y, color='gray', lw=0.3, alpha=0.5)
+
+    ax.set_aspect('equal')
+    ax.set_title(f"Cu Grid: {layer_name}  ({mapper.nx}×{mapper.ny})")
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    return ax
+
+
+def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
+    """Side-by-side: grid copper map vs fraction heatmap.
+
+    Left panel : grid-based binary copper (gold = Cu, white = empty)
     Right panel: copper fraction heatmap (grid mapping result)
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    plot_copper(layer, ax=ax1)
+    plot_grid_copper(mapper, layer_name=layer.name, ax=ax1)
     plot_fraction_map(mapper, ax=ax2, title=f"{layer.name} -- Grid Mapping")
     fig.tight_layout()
     return fig

@@ -678,12 +678,12 @@ def plot_fraction_map(mapper: TraceGridMapper, ax=None, cmap='YlOrRd',
 
 
 def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
-                        color='darkorange'):
+                        color='darkorange', filled_threshold=0.5):
     """Show even-odd copper result derived from already-computed fractions.
 
     Uses the mapper.fractions grid (product of even-odd per-cell computation)
-    to display which cells are filled vs empty.  Cells with fraction > 0 are
-    copper; cells with fraction == 0 are empty (background or even-overlap hole).
+    to display which cells are filled vs empty. Cells with fraction >=
+    filled_threshold are treated as copper.
     """
     import matplotlib.colors as mcolors
 
@@ -699,14 +699,18 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
     # Build two-color image: copper color where fraction > 0, white elsewhere.
     r, g, b, _ = mcolors.to_rgba(color)
     rgba = np.ones((*mapper.fractions.shape, 4))  # white background
-    mask = mapper.fractions > 0
+    # A strict >0 mask can make almost every cell appear filled due to
+    # sub-pixel edge hits. Use a configurable threshold to recover pattern.
+    mask = mapper.fractions >= filled_threshold
     rgba[mask] = [r, g, b, 0.85]       # filled cells → copper color
     rgba[~mask] = [1.0, 1.0, 1.0, 1.0]  # empty cells  → white
 
     ax.imshow(rgba, origin='lower', extent=extent, aspect='equal',
               interpolation='nearest')
     ax.set_aspect('equal')
-    ax.set_title(f"Cu even-odd: {layer_name}  ({mapper.nx}×{mapper.ny} grid)")
+    ax.set_title(
+        f"Cu even-odd: {layer_name}  ({mapper.nx}×{mapper.ny} grid, th={filled_threshold:g})"
+    )
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     return ax
@@ -723,7 +727,12 @@ def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
     # even-odd mode: avoid expensive polygon XOR; reuse computed fractions
     # for responsive PNG export.
     if mapper.even_odd:
-        plot_evenodd_copper(mapper, layer_name=f"{layer.name} (from grid)", ax=ax1)
+        plot_evenodd_copper(
+            mapper,
+            layer_name=f"{layer.name} (from grid)",
+            ax=ax1,
+            filled_threshold=0.5,
+        )
     else:
         mapping_geom = _get_geometry_used_for_mapping(mapper)
         plot_copper(mapping_geom, layer_name=layer.name, ax=ax1)

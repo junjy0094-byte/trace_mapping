@@ -593,33 +593,24 @@ class TraceGridMapper:
 #  Visualization
 # ---------------------------------------------------------------------------
 
-def _get_geometry_used_for_mapping(mapper: TraceGridMapper):
-    """Build display geometry from the same polygon set/rule used in mapping.
-
-    - even_odd=True  : return None (use computed grid-mask view for speed)
-    - merged mode    : use mapper.copper directly
-    - individual mode: OR union across mapper.copper_polys
-    """
+def _get_design_copper_geometry(layer: GerberLayer):
+    """Return copper geometry for design-view plotting (actual Cu area only)."""
     from shapely.ops import unary_union
 
-    # NOTE:
-    # Exact polygon XOR across many shapes can be very expensive and caused
-    # PNG export to stall for large datasets. In even-odd mode, we therefore
-    # render from already-computed grid fractions instead (see plot_comparison).
-    if mapper.even_odd:
-        return None
+    # Prefer merged copper if already available.
+    if layer.copper is not None:
+        return layer.copper
 
-    if mapper.copper is not None:
-        return mapper.copper
-
-    if mapper.copper_polys:
-        return unary_union(mapper.copper_polys)
+    # In no-merge/even-odd runs, layer.copper can be None; for plotting the
+    # actual design Cu shape, stitch all Cu polygons once for display.
+    if layer.copper_polys:
+        return unary_union(layer.copper_polys)
 
     return None
 
 
 def plot_copper(geom, layer_name="", ax=None, color='darkorange', alpha=0.7):
-    """Plot copper geometry outline from a Shapely geometry."""
+    """Plot filled copper geometry from a Shapely geometry."""
     from shapely.geometry import MultiPolygon, Polygon as ShapelyPolygon
     if ax is None:
         fig, ax = plt.subplots(1, 1, figsize=(10, 8))
@@ -642,7 +633,7 @@ def plot_copper(geom, layer_name="", ax=None, color='darkorange', alpha=0.7):
             ax.fill(ix, iy, fc='white', ec='none', alpha=1.0)
 
     ax.set_aspect('equal')
-    ax.set_title(f"Copper used in mapping: {layer_name}")
+    ax.set_title(f"Design Cu: {layer_name}")
     return ax
 
 
@@ -719,23 +710,12 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
 def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
     """Side-by-side: raw copper artwork vs fraction heatmap.
 
-    Left panel : mapping-source view (fast path for even-odd uses grid mask)
+    Left panel : actual design Cu area (filled yellow)
     Right panel: copper fraction heatmap (grid mapping result)
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-
-    # even-odd mode: avoid expensive polygon XOR; reuse computed fractions
-    # for responsive PNG export.
-    if mapper.even_odd:
-        plot_evenodd_copper(
-            mapper,
-            layer_name=f"{layer.name} (from grid)",
-            ax=ax1,
-            filled_threshold=0.5,
-        )
-    else:
-        mapping_geom = _get_geometry_used_for_mapping(mapper)
-        plot_copper(mapping_geom, layer_name=layer.name, ax=ax1)
+    design_geom = _get_design_copper_geometry(layer)
+    plot_copper(design_geom, layer_name=layer.name, ax=ax1)
 
     plot_fraction_map(mapper, ax=ax2, title=f"{layer.name} -- Grid Mapping")
     fig.tight_layout()

@@ -741,19 +741,21 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
 def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
     """Side-by-side: raw copper artwork vs fraction heatmap.
 
-    Left panel : stitched grid blocks (cells used for density)
+    Left panel : actual Gerber Cu drawing (yellow) with grid overlay
     Right panel: copper fraction heatmap (grid mapping result)
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    # even-odd mode: only keep cells that are judged as interior-filled.
-    # Using 0.5 avoids painting nearly-all cells due to tiny edge overlaps.
-    min_fraction = 0.5 if mapper.even_odd else 0.0
-    grid_geom = _grid_blocks_to_geometry(mapper, min_fraction=min_fraction)
-    plot_copper(
-        grid_geom,
-        layer_name=f"{layer.name} (stitched grid blocks, th={min_fraction:g})",
-        ax=ax1,
-    )
+    design_geom = _get_design_copper_geometry(layer)
+    plot_copper(design_geom, layer_name=f"{layer.name} (Gerber Cu)", ax=ax1)
+
+    # Overlay mapping grid so each cell shows the original Gerber drawing inside.
+    info = mapper.grid_info
+    for i in range(mapper.nx + 1):
+        x = info['xmin'] + i * info['dx']
+        ax1.axvline(x, color='gray', lw=0.3, alpha=0.5)
+    for j in range(mapper.ny + 1):
+        y = info['ymin'] + j * info['dy']
+        ax1.axhline(y, color='gray', lw=0.3, alpha=0.5)
 
     plot_fraction_map(mapper, ax=ax2, title=f"{layer.name} -- Grid Mapping")
     fig.tight_layout()

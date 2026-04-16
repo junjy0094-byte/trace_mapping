@@ -593,37 +593,43 @@ class TraceGridMapper:
 #  Visualization
 # ---------------------------------------------------------------------------
 
-def plot_copper(layer: GerberLayer, ax=None, color='darkorange', alpha=0.7,
-                merged_view=False):
-    """Plot copper geometry outline.
+def _get_geometry_used_for_mapping(mapper: TraceGridMapper):
+    """Build display geometry from the same polygon set/rule used in mapping.
 
-    Args:
-        merged_view: If True, always render the union of all source polygons
-                     (visual-only). This does not affect grid density
-                     computation and is used for left-panel comparison output.
+    - even_odd=True  : XOR (symmetric_difference) across mapper.copper_polys
+    - merged mode    : use mapper.copper directly
+    - individual mode: OR union across mapper.copper_polys
     """
-    from shapely.geometry import MultiPolygon, Polygon as ShapelyPolygon
     from shapely.ops import unary_union
+
+    if mapper.even_odd and mapper.copper_polys:
+        geom = None
+        for poly in mapper.copper_polys:
+            geom = poly if geom is None else geom.symmetric_difference(poly)
+        return geom
+
+    if mapper.copper is not None:
+        return mapper.copper
+
+    if mapper.copper_polys:
+        return unary_union(mapper.copper_polys)
+
+    return None
+
+
+def plot_copper(geom, layer_name="", ax=None, color='darkorange', alpha=0.7):
+    """Plot copper geometry outline from a Shapely geometry."""
+    from shapely.geometry import MultiPolygon, Polygon as ShapelyPolygon
     if ax is None:
         fig, ax = plt.subplots(1, 1, figsize=(10, 8))
 
-    # Get polygon list depending on mode / rendering option
-    if merged_view:
-        # Visualise all polygons as one stitched geometry, regardless of
-        # compute mode (even-odd / no-merge / merged).
-        geom = unary_union(layer.copper_polys)
-        if isinstance(geom, MultiPolygon):
-            polys = list(geom.geoms)
-        else:
-            polys = [geom]
-    elif layer.copper is not None:
-        geom = layer.copper
-        if isinstance(geom, MultiPolygon):
-            polys = list(geom.geoms)
-        else:
-            polys = [geom]
+    if geom is None or geom.is_empty:
+        polys = []
     else:
-        polys = layer.copper_polys
+        if isinstance(geom, MultiPolygon):
+            polys = list(geom.geoms)
+        else:
+            polys = [geom]
 
     for poly in polys:
         if not isinstance(poly, ShapelyPolygon):
@@ -635,7 +641,7 @@ def plot_copper(layer: GerberLayer, ax=None, color='darkorange', alpha=0.7,
             ax.fill(ix, iy, fc='white', ec='none', alpha=1.0)
 
     ax.set_aspect('equal')
-    ax.set_title(f"Copper: {layer.name}")
+    ax.set_title(f"Copper used in mapping: {layer_name}")
     return ax
 
 
@@ -708,11 +714,12 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
 def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
     """Side-by-side: raw copper artwork vs fraction heatmap.
 
-    Left panel : stitched (merged) polygons used as source for grid mapping
+    Left panel : geometry reconstructed from polygons/rule used in mapping
     Right panel: copper fraction heatmap (grid mapping result)
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    plot_copper(layer, ax=ax1, merged_view=True)
+    mapping_geom = _get_geometry_used_for_mapping(mapper)
+    plot_copper(mapping_geom, layer_name=layer.name, ax=ax1)
     plot_fraction_map(mapper, ax=ax2, title=f"{layer.name} -- Grid Mapping")
     fig.tight_layout()
     return fig

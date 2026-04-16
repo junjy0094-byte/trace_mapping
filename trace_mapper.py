@@ -403,6 +403,8 @@ class TraceGridMapper:
         copper_polys: List of individual copper polygons (or None)
         nx, ny: Grid divisions in X and Y
         bounds: (xmin, ymin, xmax, ymax) override, or auto from copper
+        even_odd: If True, apply even-odd fill rule per cell (odd overlaps=filled,
+                  even overlaps=empty). Requires copper_polys (individual mode).
         fractions: 2D numpy array [ny, nx] of copper fractions (0~1)
     """
     copper: object = None
@@ -410,6 +412,7 @@ class TraceGridMapper:
     nx: int = 20
     ny: int = 20
     bounds: Optional[Tuple[float, float, float, float]] = None
+    even_odd: bool = False
     fractions: np.ndarray = field(default=None, repr=False)
 
     def __post_init__(self):
@@ -509,6 +512,85 @@ class TraceGridMapper:
                 # Clamp to 1.0 (overlapping polygons could exceed cell_area)
                 self.fractions[j, i] = min(total_area / cell_area, 1.0)
 
+    def _compute_evenodd(self):
+        """Compute fractions using even-odd fill rule per cell.
+
+        For each cell, count how many polygons cover each point:
+          - Odd count  → filled  (1 layer, 3+ layers)
+          - Even count → empty   (2-layer hollow interior)
+
+        Algorithm (fast path for interior cells):
+          1. Polygons fully containing the cell contribute to a parity counter
+             (no geometry ops needed).
+          2. Polygons partially intersecting the cell are XOR'd geometrically
+             within the cell.
+          3. If the parity counter is odd, start from the full cell; otherwise
+             start from empty. Then apply the partial XORs.
+
+        This allows hollow shapes: drawing a big rect + small rect inside
+        produces a hole (2 overlaps = even = empty), while patterns inside
+        the hole (3 overlaps = odd = filled) stay filled.
+        """
+        from shapely.geometry import box, GeometryCollection
+        from shapely import strtree, prepared
+
+        xmin, ymin, xmax, ymax = self.bounds
+        dx = (xmax - xmin) / self.nx
+        dy = (ymax - ymin) / self.ny
+        cell_area = dx * dy
+
+        self.fractions = np.zeros((self.ny, self.nx), dtype=np.float64)
+
+        # Build spatial index and prepared geometries for fast contains()
+        tree = strtree.STRtree(self.copper_polys)
+        prep_polys = [prepared.prep(p) for p in self.copper_polys]
+
+        for j in range(self.ny):
+            for i in range(self.nx):
+                x0 = xmin + i * dx
+                y0 = ymin + j * dy
+                cell = box(x0, y0, x0 + dx, y0 + dy)
+
+                try:
+                    candidates = tree.query(cell)
+                except TypeError:
+                    candidates = tree.query(cell)
+
+                if len(candidates) == 0:
+                    continue
+
+                # Separate fully-containing polygons (fast path) from partial ones
+                contain_count = 0
+                partial_geoms = []
+
+                for idx in candidates:
+                    if isinstance(idx, (int, np.integer)):
+                        poly = self.copper_polys[idx]
+                        prep = prep_polys[idx]
+                    else:
+                        poly = idx
+                        prep = prepared.prep(poly)
+
+                    if prep.contains(cell):
+                        # Full containment: no geometry needed, just track parity
+                        contain_count += 1
+                    else:
+                        inter = poly.intersection(cell)
+                        if not inter.is_empty:
+                            partial_geoms.append(inter)
+
+                # Start from full cell (odd parity) or empty (even parity),
+                # then XOR each partial intersection
+                if contain_count % 2 == 1:
+                    result = cell  # odd containing polys → starts filled
+                else:
+                    result = GeometryCollection()  # even → starts empty
+
+                for geom in partial_geoms:
+                    result = result.symmetric_difference(geom)
+
+                self.fractions[j, i] = result.area / cell_area
+
     def compute(self):
         """Compute copper fraction for each grid cell."""
         xmin, ymin, xmax, ymax = self.bounds
@@ -521,7 +603,11 @@ class TraceGridMapper:
 
         total = self.nx * self.ny
 
-        if self.copper is not None:
+        if self.even_odd:
+            if not self.copper_polys:
+                raise ValueError("even_odd mode requires copper_polys (individual polygons)")
+            mode = "even-odd"
+        elif self.copper is not None:
             mode = "merged"
         elif self.copper_polys:
             mode = "individual"
@@ -532,7 +618,9 @@ class TraceGridMapper:
               flush=True)
         t0 = time.time()
 
-        if mode == "merged":
+        if mode == "even-odd":
+            self._compute_evenodd()
+        elif mode == "merged":
             self._compute_merged()
         else:
             self._compute_individual()
@@ -651,10 +739,54 @@ def plot_fraction_map(mapper: TraceGridMapper, ax=None, cmap='YlOrRd',
     return ax
 
 
+def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
+                        color='darkorange'):
+    """Show even-odd copper result derived from already-computed fractions.
+
+    Uses the mapper.fractions grid (product of even-odd per-cell computation)
+    to display which cells are filled vs empty.  Cells with fraction > 0 are
+    copper; cells with fraction == 0 are empty (background or even-overlap hole).
+    """
+    import matplotlib.colors as mcolors
+
+    if ax is None:
+        _, ax = plt.subplots(1, 1, figsize=(10, 8))
+
+    if mapper.fractions is None:
+        mapper.compute()
+
+    info = mapper.grid_info
+    extent = [info['xmin'], info['xmax'], info['ymin'], info['ymax']]
+
+    # Build two-color image: copper color where fraction > 0, white elsewhere.
+    r, g, b, _ = mcolors.to_rgba(color)
+    rgba = np.ones((*mapper.fractions.shape, 4))  # white background
+    mask = mapper.fractions > 0
+    rgba[mask] = [r, g, b, 0.85]       # filled cells → copper color
+    rgba[~mask] = [1.0, 1.0, 1.0, 1.0]  # empty cells  → white
+
+    ax.imshow(rgba, origin='lower', extent=extent, aspect='equal',
+              interpolation='nearest')
+    ax.set_aspect('equal')
+    ax.set_title(f"Cu even-odd: {layer_name}  ({mapper.nx}×{mapper.ny} grid)")
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    return ax
+
+
 def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
-    """Side-by-side: raw copper vs fraction heatmap."""
+    """Side-by-side: copper view vs fraction heatmap.
+
+    Left panel:
+      - even-odd mode: shows even-odd fill result (holes visible)
+      - other modes  : shows raw copper polygons
+    Right panel: copper fraction heatmap.
+    """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    plot_copper(layer, ax=ax1)
+    if mapper.even_odd:
+        plot_evenodd_copper(mapper, layer_name=layer.name, ax=ax1)
+    else:
+        plot_copper(layer, ax=ax1)
     plot_fraction_map(mapper, ax=ax2, title=f"{layer.name} -- Grid Mapping")
     fig.tight_layout()
     return fig
@@ -699,7 +831,8 @@ def compute_shared_bounds(layers: List[GerberLayer]):
 def process_layers(filepaths: List[str], nx=20, ny=20,
                    bounds=None, shared_bounds=True,
                    export_csv=True, plot=True, show=False, outdir=None,
-                   merge_tolerance=0.0, no_merge=False, interactive=False):
+                   merge_tolerance=0.0, no_merge=False, interactive=False,
+                   even_odd=True):
     """
     Process multiple Gerber layer files.
 
@@ -712,6 +845,9 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         no_merge: If True, skip unary_union entirely. Individual polygons are
                   used with STRtree spatial index for grid computation. This
                   preserves fine traces that would otherwise merge.
+        even_odd: If True (default), apply even-odd fill rule per cell.
+                  Odd overlaps = filled, even overlaps = empty (hollow interior).
+                  Enables hollow shapes: big rect + small rect inside = hole.
     Returns:
         dict: {layer_name: TraceGridMapper}
     """
@@ -756,7 +892,15 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         b = unified_bounds if unified_bounds else None
 
         # Create mapper with appropriate mode
-        if layer.no_merge or layer.copper is None:
+        if even_odd:
+            # Even-odd fill rule: hollow shapes supported, fast per-cell XOR.
+            # Requires individual polygons (no global merge).
+            mapper = TraceGridMapper(
+                copper_polys=layer.copper_polys,
+                nx=nx, ny=ny, bounds=b,
+                even_odd=True,
+            )
+        elif layer.no_merge or layer.copper is None:
             mapper = TraceGridMapper(
                 copper_polys=layer.copper_polys,
                 nx=nx, ny=ny, bounds=b,
@@ -853,16 +997,24 @@ def main():
         help='Skip polygon union entirely. Each polygon is kept separate and '
              'grid fractions are computed using STRtree spatial index. '
              'Best for preserving very fine traces that otherwise merge.')
+    merge_group.add_argument(
+        '--no-even-odd', action='store_true',
+        help='Disable even-odd fill rule (default: even-odd is ON). '
+             'With even-odd OFF, overlapping areas are summed (clamped to 1). '
+             'Use this only if hollow shapes are not needed.')
 
     args = parser.parse_args()
+    use_even_odd = not args.no_even_odd
 
     files = collect_art_files(args.paths)
     print(f"\nFound {len(files)} Gerber file(s):")
     for f in files:
         print(f"  {f}")
 
-    if args.no_merge:
-        print("\nMode: NO-MERGE (individual polygons, STRtree spatial index)")
+    if use_even_odd:
+        print("\nMode: EVEN-ODD (hollow shapes: 2 overlaps=hole, 3+overlaps=filled)")
+    elif args.no_merge:
+        print("\nMode: NO-MERGE (individual polygons, area sum, STRtree spatial index)")
     elif args.merge_tolerance > 0:
         print(f"\nMode: MERGE with tolerance={args.merge_tolerance}")
     else:
@@ -880,6 +1032,7 @@ def main():
         merge_tolerance=args.merge_tolerance,
         no_merge=args.no_merge,
         interactive=args.interactive,
+        even_odd=use_even_odd,
     )
 
     if args.show:

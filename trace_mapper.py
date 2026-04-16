@@ -513,23 +513,26 @@ class TraceGridMapper:
                 self.fractions[j, i] = min(total_area / cell_area, 1.0)
 
     def _compute_evenodd(self):
-        """Compute fractions using per-cell union of copper polygons.
+        """Compute fractions using even-odd fill rule per cell.
 
-        For each cell, find all copper polygons that intersect it,
-        compute their intersections with the cell, union them, and
-        measure the resulting copper area.
+        For each cell, count how many polygons cover each point:
+          - Odd count  → filled  (1 layer, 3+ layers)
+          - Even count → empty   (2-layer hollow interior)
 
-        This approach correctly handles overlapping primitives (pads on
-        traces, trace junctions, etc.) as additive copper via union,
-        avoiding false holes that XOR-based even-odd would create at
-        every 2-layer overlap.
+        Algorithm (fast path for interior cells):
+          1. Polygons fully containing the cell contribute to a parity counter
+             (no geometry ops needed).
+          2. Polygons partially intersecting the cell are XOR'd geometrically
+             within the cell.
+          3. If the parity counter is odd, start from the full cell; otherwise
+             start from empty. Then apply the partial XORs.
 
-        Uses STRtree spatial index for fast candidate lookup and prepared
-        geometries for fast full-containment checks.
+        This allows hollow shapes: drawing a big rect + small rect inside
+        produces a hole (2 overlaps = even = empty), while patterns inside
+        the hole (3 overlaps = odd = filled) stay filled.
         """
-        from shapely.geometry import box
+        from shapely.geometry import box, GeometryCollection
         from shapely import strtree, prepared
-        from shapely.ops import unary_union
 
         xmin, ymin, xmax, ymax = self.bounds
         dx = (xmax - xmin) / self.nx
@@ -556,9 +559,9 @@ class TraceGridMapper:
                 if len(candidates) == 0:
                     continue
 
-                # Collect polygon-cell intersections; fast-exit on full coverage
-                intersections = []
-                full_coverage = False
+                # Separate fully-containing polygons (fast path) from partial ones
+                contain_count = 0
+                partial_geoms = []
 
                 for idx in candidates:
                     if isinstance(idx, (int, np.integer)):
@@ -569,20 +572,24 @@ class TraceGridMapper:
                         prep = prepared.prep(poly)
 
                     if prep.contains(cell):
-                        # Any single polygon fully covers this cell → fraction=1
-                        full_coverage = True
-                        break
+                        # Full containment: no geometry needed, just track parity
+                        contain_count += 1
+                    else:
+                        inter = poly.intersection(cell)
+                        if not inter.is_empty:
+                            partial_geoms.append(inter)
 
-                    inter = poly.intersection(cell)
-                    if not inter.is_empty:
-                        intersections.append(inter)
+                # Start from full cell (odd parity) or empty (even parity),
+                # then XOR each partial intersection
+                if contain_count % 2 == 1:
+                    result = cell  # odd containing polys → starts filled
+                else:
+                    result = GeometryCollection()  # even → starts empty
 
-                if full_coverage:
-                    self.fractions[j, i] = 1.0
-                elif intersections:
-                    # Union all partial intersections to get true copper area
-                    merged = unary_union(intersections)
-                    self.fractions[j, i] = merged.area / cell_area
+                for geom in partial_geoms:
+                    result = result.symmetric_difference(geom)
+
+                self.fractions[j, i] = result.area / cell_area
 
     def compute(self):
         """Compute copper fraction for each grid cell."""
@@ -734,10 +741,11 @@ def plot_fraction_map(mapper: TraceGridMapper, ax=None, cmap='YlOrRd',
 
 def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
                         color='darkorange'):
-    """Show copper density derived from already-computed fractions.
+    """Show even-odd copper result derived from already-computed fractions.
 
-    Uses the mapper.fractions grid to display copper coverage per cell.
-    Fraction value modulates colour intensity: 0 → white, 1 → full copper.
+    Uses the mapper.fractions grid (product of even-odd per-cell computation)
+    to display which cells are filled vs empty.  Cells with fraction > 0 are
+    copper; cells with fraction == 0 are empty (background or even-overlap hole).
     """
     import matplotlib.colors as mcolors
 
@@ -750,14 +758,12 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
     info = mapper.grid_info
     extent = [info['xmin'], info['xmax'], info['ymin'], info['ymax']]
 
-    # Fraction-proportional blending: white (0) → copper colour (1)
+    # Build two-color image: copper color where fraction > 0, white elsewhere.
     r, g, b, _ = mcolors.to_rgba(color)
-    rgba = np.ones((*mapper.fractions.shape, 4))  # start white
-    fracs = mapper.fractions
-    rgba[..., 0] = 1.0 - fracs * (1.0 - r)
-    rgba[..., 1] = 1.0 - fracs * (1.0 - g)
-    rgba[..., 2] = 1.0 - fracs * (1.0 - b)
-    rgba[..., 3] = 1.0  # fully opaque
+    rgba = np.ones((*mapper.fractions.shape, 4))  # white background
+    mask = mapper.fractions > 0
+    rgba[mask] = [r, g, b, 0.85]       # filled cells → copper color
+    rgba[~mask] = [1.0, 1.0, 1.0, 1.0]  # empty cells  → white
 
     ax.imshow(rgba, origin='lower', extent=extent, aspect='equal',
               interpolation='nearest')
@@ -769,18 +775,13 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
 
 
 def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
-    """Side-by-side: copper view vs fraction heatmap.
+    """Side-by-side: raw copper artwork vs fraction heatmap.
 
-    Left panel:
-      - even-odd mode: shows even-odd fill result (holes visible)
-      - other modes  : shows raw copper polygons
-    Right panel: copper fraction heatmap.
+    Left panel : raw copper polygons from the art file
+    Right panel: copper fraction heatmap (grid mapping result)
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    if mapper.even_odd:
-        plot_evenodd_copper(mapper, layer_name=layer.name, ax=ax1)
-    else:
-        plot_copper(layer, ax=ax1)
+    plot_copper(layer, ax=ax1)
     plot_fraction_map(mapper, ax=ax2, title=f"{layer.name} -- Grid Mapping")
     fig.tight_layout()
     return fig

@@ -609,6 +609,37 @@ def _get_design_copper_geometry(layer: GerberLayer):
     return None
 
 
+def _grid_blocks_to_geometry(mapper: TraceGridMapper, min_fraction=0.0):
+    """Build stitched geometry from grid blocks used for density evaluation.
+
+    Each grid cell with fraction > min_fraction is converted to its cell
+    rectangle and then stitched via unary_union.
+    """
+    from shapely.geometry import box
+    from shapely.ops import unary_union
+
+    if mapper.fractions is None:
+        mapper.compute()
+
+    info = mapper.grid_info
+    dx, dy = info['dx'], info['dy']
+    xmin, ymin = info['xmin'], info['ymin']
+
+    cells = []
+    for j in range(mapper.ny):
+        y0 = ymin + j * dy
+        y1 = y0 + dy
+        for i in range(mapper.nx):
+            if mapper.fractions[j, i] > min_fraction:
+                x0 = xmin + i * dx
+                x1 = x0 + dx
+                cells.append(box(x0, y0, x1, y1))
+
+    if not cells:
+        return None
+    return unary_union(cells)
+
+
 def plot_copper(geom, layer_name="", ax=None, color='darkorange', alpha=0.7):
     """Plot filled copper geometry from a Shapely geometry."""
     from shapely.geometry import MultiPolygon, Polygon as ShapelyPolygon
@@ -710,12 +741,12 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
 def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
     """Side-by-side: raw copper artwork vs fraction heatmap.
 
-    Left panel : actual design Cu area (filled yellow)
+    Left panel : stitched grid blocks (cells used for density)
     Right panel: copper fraction heatmap (grid mapping result)
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    design_geom = _get_design_copper_geometry(layer)
-    plot_copper(design_geom, layer_name=layer.name, ax=ax1)
+    grid_geom = _grid_blocks_to_geometry(mapper, min_fraction=0.0)
+    plot_copper(grid_geom, layer_name=f"{layer.name} (stitched grid blocks)", ax=ax1)
 
     plot_fraction_map(mapper, ax=ax2, title=f"{layer.name} -- Grid Mapping")
     fig.tight_layout()

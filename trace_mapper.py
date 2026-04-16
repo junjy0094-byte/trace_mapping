@@ -797,6 +797,28 @@ def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
 #  Multi-layer batch processing
 # ---------------------------------------------------------------------------
 
+def _exclude_largest_polygons(polys, n):
+    """Remove the *n* largest polygons (by area) from the list.
+
+    Useful for discarding outer-border polygons that come from the
+    Gerber board outline.  Returns the filtered list and prints which
+    polygons were removed.
+    """
+    if n <= 0 or not polys or n >= len(polys):
+        if n >= len(polys) and polys:
+            print(f"  Warning: exclude count ({n}) >= total polygons ({len(polys)}), "
+                  "skipping exclusion.")
+        return polys
+
+    indexed = sorted(enumerate(polys), key=lambda x: x[1].area, reverse=True)
+    exclude_indices = set(idx for idx, _ in indexed[:n])
+    filtered = [p for i, p in enumerate(polys) if i not in exclude_indices]
+    print(f"  Excluded {n} largest polygon(s) by area:")
+    for idx, poly in indexed[:n]:
+        print(f"    polygon #{idx}: area = {poly.area:.6f}")
+    return filtered
+
+
 def collect_art_files(paths: List[str], extensions=('.art', '.gbr')) -> List[str]:
     """
     Resolve input paths to a flat list of Gerber files.
@@ -833,7 +855,7 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                    bounds=None, shared_bounds=True,
                    export_csv=True, plot=True, show=False, outdir=None,
                    merge_tolerance=0.0, no_merge=False, interactive=False,
-                   even_odd=True):
+                   even_odd=True, exclude_largest=0):
     """
     Process multiple Gerber layer files.
 
@@ -849,6 +871,8 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         even_odd: If True (default), apply even-odd fill rule per cell.
                   Odd overlaps = filled, even overlaps = empty (hollow interior).
                   Enables hollow shapes: big rect + small rect inside = hole.
+        exclude_largest: Number of largest polygons (by area) to exclude per layer.
+                         Useful for removing outer board-outline polygons. 0 = none.
     Returns:
         dict: {layer_name: TraceGridMapper}
     """
@@ -894,6 +918,11 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
 
     for layer in layers:
         b = unified_bounds if unified_bounds else None
+
+        # Exclude largest polygons (e.g. board outline) if requested
+        if exclude_largest > 0 and layer.copper_polys:
+            layer.copper_polys = _exclude_largest_polygons(
+                layer.copper_polys, exclude_largest)
 
         # Create mapper with appropriate mode
         if even_odd:
@@ -1074,6 +1103,16 @@ def gui_main():
     ttk.Checkbutton(opt_frame, text="Show plots", variable=show_var).grid(
         row=1, column=3, padx=6, pady=2, sticky='w')
 
+    exclude_var = tk.BooleanVar(value=False)
+    exclude_n_var = tk.StringVar(value="1")
+    ttk.Checkbutton(opt_frame, text="Exclude largest poly", variable=exclude_var).grid(
+        row=2, column=0, padx=6, pady=2, sticky='w')
+    ef = tk.Frame(opt_frame)
+    ef.grid(row=2, column=1, padx=6, pady=2, sticky='w')
+    ttk.Label(ef, text="Count:").pack(side='left')
+    ttk.Spinbox(ef, from_=1, to=20, textvariable=exclude_n_var,
+                width=4).pack(side='left', padx=2)
+
     # ---- Log output ----
     log_frame = ttk.LabelFrame(root, text="Log")
     log_frame.pack(fill='both', expand=True, padx=8, pady=4)
@@ -1113,6 +1152,12 @@ def gui_main():
             return
 
         outdir = outdir_var.get().strip() or None
+        excl_n = 0
+        if exclude_var.get():
+            try:
+                excl_n = int(exclude_n_var.get())
+            except ValueError:
+                excl_n = 1
         run_btn.config(state='disabled')
         do_plot = plot_var.get()
         do_show = show_var.get()
@@ -1141,6 +1186,7 @@ def gui_main():
                     no_merge=no_merge_var.get(),
                     interactive=interactive_var.get(),
                     even_odd=even_odd_var.get(),
+                    exclude_largest=excl_n,
                 )
 
                 # Summary
@@ -1175,6 +1221,9 @@ def gui_main():
                             layer = GerberLayer(filepath=fp, no_merge=True)
                             layer.load()
                             layer.to_polygons()
+                            if excl_n > 0 and layer.copper_polys:
+                                layer.copper_polys = _exclude_largest_polygons(
+                                    layer.copper_polys, excl_n)
                             layers_by_name[layer.name] = layer
                         except Exception:
                             pass
@@ -1271,6 +1320,10 @@ def main():
         help='Disable even-odd fill rule (default: even-odd is ON). '
              'With even-odd OFF, overlapping areas are summed (clamped to 1). '
              'Use this only if hollow shapes are not needed.')
+    parser.add_argument(
+        '--exclude-largest', type=int, default=0, metavar='N',
+        help='Exclude the N largest polygons (by area) per layer. '
+             'Useful for removing outer board-outline polygons. (default: 0)')
 
     args = parser.parse_args()
 
@@ -1308,6 +1361,7 @@ def main():
         no_merge=args.no_merge,
         interactive=args.interactive,
         even_odd=use_even_odd,
+        exclude_largest=args.exclude_largest,
     )
 
     if args.show:

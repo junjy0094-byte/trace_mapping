@@ -755,17 +755,46 @@ def _even_odd_union(polys):
     for i in range(n):
         groups[find(i)].append(i)
 
-    # --- 3. XOR only within overlapping clusters ---
+    # --- 3. XOR within overlapping clusters, with custom 3+ rule ---
     results = []
     for indices in groups.values():
         if len(indices) == 1:
-            # No overlap — keep polygon as-is
             results.append(polys[indices[0]])
-        else:
+        elif len(indices) == 2:
+            # 2 polygons: standard XOR is correct (1=fill, 2=empty)
             grp = [polys[i] for i in indices]
-            xor = _dc_xor(grp)
+            xor = grp[0].symmetric_difference(grp[1])
             if not xor.is_empty:
                 results.append(xor)
+        else:
+            # 3+ polygons in cluster: XOR then restore 4+ overlap holes
+            grp = [polys[i] for i in indices]
+            xor = _dc_xor(grp)
+            grp_union = unary_union(grp)
+            # Holes from even-overlap (count 2, 4, 6…)
+            even_holes = grp_union.difference(xor)
+            if even_holes.is_empty:
+                if not xor.is_empty:
+                    results.append(xor)
+            else:
+                # Add back holes where overlap >= 4 (should be filled)
+                if isinstance(even_holes, MP):
+                    parts = list(even_holes.geoms)
+                elif isinstance(even_holes, SP) and not even_holes.is_empty:
+                    parts = [even_holes]
+                else:
+                    parts = []
+                add_back = []
+                for hole in parts:
+                    if hole.is_empty or hole.area <= 0:
+                        continue
+                    pt = hole.representative_point()
+                    cnt = sum(1 for p in grp if p.contains(pt))
+                    if cnt >= 4:
+                        add_back.append(hole)
+                final = unary_union([xor] + add_back) if add_back else xor
+                if not final.is_empty:
+                    results.append(final)
 
     if not results:
         return SP()

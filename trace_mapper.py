@@ -593,14 +593,30 @@ class TraceGridMapper:
 #  Visualization
 # ---------------------------------------------------------------------------
 
-def plot_copper(layer: GerberLayer, ax=None, color='darkorange', alpha=0.7):
-    """Plot copper geometry outline."""
+def plot_copper(layer: GerberLayer, ax=None, color='darkorange', alpha=0.7,
+                merged_view=False):
+    """Plot copper geometry outline.
+
+    Args:
+        merged_view: If True, always render the union of all source polygons
+                     (visual-only). This does not affect grid density
+                     computation and is used for left-panel comparison output.
+    """
     from shapely.geometry import MultiPolygon, Polygon as ShapelyPolygon
+    from shapely.ops import unary_union
     if ax is None:
         fig, ax = plt.subplots(1, 1, figsize=(10, 8))
 
-    # Get polygon list depending on mode
-    if layer.copper is not None:
+    # Get polygon list depending on mode / rendering option
+    if merged_view:
+        # Visualise all polygons as one stitched geometry, regardless of
+        # compute mode (even-odd / no-merge / merged).
+        geom = unary_union(layer.copper_polys)
+        if isinstance(geom, MultiPolygon):
+            polys = list(geom.geoms)
+        else:
+            polys = [geom]
+    elif layer.copper is not None:
         geom = layer.copper
         if isinstance(geom, MultiPolygon):
             polys = list(geom.geoms)
@@ -692,11 +708,11 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
 def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
     """Side-by-side: raw copper artwork vs fraction heatmap.
 
-    Left panel : raw copper polygons from the art file
+    Left panel : stitched (merged) polygons used as source for grid mapping
     Right panel: copper fraction heatmap (grid mapping result)
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    plot_copper(layer, ax=ax1)
+    plot_copper(layer, ax=ax1, merged_view=True)
     plot_fraction_map(mapper, ax=ax2, title=f"{layer.name} -- Grid Mapping")
     fig.tight_layout()
     return fig

@@ -1023,6 +1023,8 @@ def gui_main():
 
         outdir = outdir_var.get().strip() or None
         run_btn.config(state='disabled')
+        do_plot = plot_var.get()
+        do_show = show_var.get()
 
         def worker():
             # Redirect stdout to log widget
@@ -1035,13 +1037,14 @@ def gui_main():
                     return
                 log(f"Found {len(files)} Gerber file(s)\n")
 
+                # Compute only – no matplotlib calls in this thread
                 results = process_layers(
                     filepaths=files,
                     nx=nx, ny=ny,
                     shared_bounds=shared_bounds_var.get(),
                     export_csv=export_csv_var.get(),
-                    plot=plot_var.get(),
-                    show=False,   # we call plt.show() ourselves below
+                    plot=False,
+                    show=False,
                     outdir=outdir,
                     merge_tolerance=merge_tol,
                     no_merge=no_merge_var.get(),
@@ -1057,17 +1060,54 @@ def gui_main():
                         f"avg Cu = {mapper.fractions.mean():.4f}, "
                         f"max = {mapper.fractions.max():.4f}\n")
 
-                if show_var.get() and results:
-                    log("Displaying plots...\n")
-                    plt.show()
-
                 log("Done.\n")
+
+                # Schedule matplotlib work on the main (tkinter) thread
+                root.after(0, lambda: _finish_plots(results, files, outdir))
+
             except Exception as e:
                 log(f"\nERROR: {e}\n")
                 import traceback
                 log(traceback.format_exc())
+                root.after(0, lambda: run_btn.config(state='normal'))
             finally:
                 sys.stdout = old_stdout
+
+        def _finish_plots(results, files, out):
+            """Generate plots & savefig on the main thread (matplotlib requirement)."""
+            try:
+                if do_plot or do_show:
+                    # Reload layers minimally for plotting (need polygon data)
+                    layers_by_name = {}
+                    for fp in files:
+                        try:
+                            layer = GerberLayer(filepath=fp, no_merge=True)
+                            layer.load()
+                            layer.to_polygons()
+                            layers_by_name[layer.name] = layer
+                        except Exception:
+                            pass
+
+                    for name, mapper in results.items():
+                        layer = layers_by_name.get(name)
+                        if layer is None:
+                            continue
+                        stem = Path(layer.filepath).stem
+                        out_base = Path(out) if out else Path(layer.filepath).parent
+
+                        if do_plot:
+                            fig = plot_comparison(layer, mapper)
+                            png_path = out_base / f"{stem}.png"
+                            fig.savefig(str(png_path), dpi=150, bbox_inches='tight')
+                            if not do_show:
+                                plt.close(fig)
+                            log(f"Plot saved: {png_path}\n")
+
+                    if do_show:
+                        plt.show()
+            except Exception as e:
+                log(f"\nPlot ERROR: {e}\n")
+            finally:
                 run_btn.config(state='normal')
 
         threading.Thread(target=worker, daemon=True).start()

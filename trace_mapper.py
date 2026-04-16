@@ -503,7 +503,8 @@ class TraceGridMapper:
 
         # Collapse sub-pixels → grid cells
         if mode == "even-odd":
-            sampled = (grid % 2 == 1).astype(np.float64)
+            # Custom rule: 1=filled, 2=empty, 3+=always filled
+            sampled = ((grid > 0) & (grid != 2)).astype(np.float64)
         else:
             sampled = grid.astype(np.float64)
 
@@ -689,12 +690,9 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
     return ax
 
 
-def _even_odd_union(polys):
-    """Compute even-odd fill result from a list of polygons.
+def _xor_union(polys):
+    """Standard XOR (symmetric_difference) of all polygons.
 
-    Uses symmetric_difference (XOR) which is associative/commutative:
-    areas covered by an odd number of polygons are filled,
-    areas covered by an even number become holes.
     Divide-and-conquer to keep intermediate results simple.
     """
     from shapely.geometry import Polygon as SP, MultiPolygon as MP, GeometryCollection
@@ -707,18 +705,66 @@ def _even_odd_union(polys):
         return polys[0]
 
     mid = n // 2
-    left = _even_odd_union(polys[:mid])
-    right = _even_odd_union(polys[mid:])
+    left = _xor_union(polys[:mid])
+    right = _xor_union(polys[mid:])
     result = left.symmetric_difference(right)
 
-    # symmetric_difference can return GeometryCollection with stray
-    # lines/points; keep only Polygon parts.
     if isinstance(result, GeometryCollection) and not isinstance(result, (SP, MP)):
         poly_parts = [g for g in result.geoms if isinstance(g, SP)]
         if not poly_parts:
             return SP()
         return unary_union(poly_parts)
     return result
+
+
+def _even_odd_union(polys):
+    """Custom fill rule: 1=filled, 2=empty, 3+=always filled.
+
+    Equivalent to: full_union minus areas_with_exactly_2_overlaps.
+    Steps:
+      1. XOR  → areas with odd overlap count (1, 3, 5 …)
+      2. union - XOR → areas with even overlap count (2, 4, 6 …)
+      3. Among even-overlap areas, add back those with count >= 4
+         (sample representative point, count containing polygons)
+      4. Result = XOR + added-back areas
+    """
+    from shapely.geometry import Polygon as SP, MultiPolygon as MP
+    from shapely.ops import unary_union
+
+    if not polys:
+        return SP()
+    if len(polys) == 1:
+        return polys[0]
+
+    full_union = unary_union(polys)
+    xor_result = _xor_union(polys)
+
+    # even_holes = areas where overlap count is even (2, 4, 6 …)
+    even_holes = full_union.difference(xor_result)
+    if even_holes.is_empty:
+        return xor_result
+
+    # Separate hole polygons and check overlap count
+    if isinstance(even_holes, MP):
+        hole_parts = list(even_holes.geoms)
+    elif isinstance(even_holes, SP):
+        hole_parts = [even_holes]
+    else:
+        hole_parts = [g for g in even_holes.geoms if isinstance(g, SP)]
+
+    # Add back hole regions with count >= 4 (they should be filled)
+    add_back = []
+    for hole in hole_parts:
+        if hole.is_empty or hole.area <= 0:
+            continue
+        pt = hole.representative_point()
+        count = sum(1 for p in polys if p.contains(pt))
+        if count >= 3:
+            add_back.append(hole)
+
+    if add_back:
+        return unary_union([xor_result] + add_back)
+    return xor_result
 
 
 def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
@@ -921,7 +967,7 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
 
         # Exclude largest polygons (e.g. board outline) if requested
         if exclude_largest > 0 and layer.copper_polys:
-            layer.copper_polys = _exclude_largest_polygons(
+            layer._copper_polys = _exclude_largest_polygons(
                 layer.copper_polys, exclude_largest)
 
         # Create mapper with appropriate mode
@@ -1222,7 +1268,7 @@ def gui_main():
                             layer.load()
                             layer.to_polygons()
                             if excl_n > 0 and layer.copper_polys:
-                                layer.copper_polys = _exclude_largest_polygons(
+                                layer._copper_polys = _exclude_largest_polygons(
                                     layer.copper_polys, excl_n)
                             layers_by_name[layer.name] = layer
                         except Exception:

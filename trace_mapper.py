@@ -414,6 +414,8 @@ class TraceGridMapper:
     bounds: Optional[Tuple[float, float, float, float]] = None
     even_odd: bool = False
     fractions: np.ndarray = field(default=None, repr=False)
+    sampled_mask: np.ndarray = field(default=None, repr=False)  # sub-pixel raster mask used in compute
+    sub_sampling: int = field(default=0, repr=False)            # samples per cell per axis
 
     def __post_init__(self):
         if self.bounds is None:
@@ -507,6 +509,8 @@ class TraceGridMapper:
         else:
             sampled = grid.astype(np.float64)
 
+        self.sampled_mask = sampled
+        self.sub_sampling = SUB
         self.fractions = sampled.reshape(
             self.ny, SUB, self.nx, SUB
         ).mean(axis=(1, 3))
@@ -689,14 +693,47 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
     return ax
 
 
-def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
-    """Side-by-side: raw copper artwork vs fraction heatmap.
+def plot_rasterized_copper(mapper: TraceGridMapper, layer_name="", ax=None,
+                           color='darkorange'):
+    """Show rasterised copper mask actually used during grid computation."""
+    import matplotlib.colors as mcolors
 
-    Left panel : raw copper polygons from the art file
+    if ax is None:
+        _, ax = plt.subplots(1, 1, figsize=(10, 8))
+
+    if mapper.fractions is None:
+        mapper.compute()
+    if mapper.sampled_mask is None:
+        raise ValueError("No sampled raster mask available. Run mapper.compute() first.")
+
+    info = mapper.grid_info
+    extent = [info['xmin'], info['xmax'], info['ymin'], info['ymax']]
+
+    r, g, b, _ = mcolors.to_rgba(color)
+    mask = mapper.sampled_mask > 0
+    rgba = np.ones((*mask.shape, 4))  # white background
+    rgba[mask] = [r, g, b, 0.9]
+
+    ax.imshow(rgba, origin='lower', extent=extent, aspect='equal',
+              interpolation='nearest')
+    ax.set_aspect('equal')
+    ax.set_title(
+        f"Cu raster mask (calc basis): {layer_name}  "
+        f"(sub-pixel {mapper.sub_sampling}x per cell)"
+    )
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    return ax
+
+
+def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
+    """Side-by-side: raster mask used in compute vs fraction heatmap.
+
+    Left panel : rasterised copper mask used for density calculation
     Right panel: copper fraction heatmap (grid mapping result)
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    plot_copper(layer, ax=ax1)
+    plot_rasterized_copper(mapper, layer_name=layer.name, ax=ax1)
     plot_fraction_map(mapper, ax=ax2, title=f"{layer.name} -- Grid Mapping")
     fig.tight_layout()
     return fig

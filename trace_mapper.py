@@ -612,7 +612,7 @@ def _get_design_copper_geometry(layer: GerberLayer):
 def _grid_blocks_to_geometry(mapper: TraceGridMapper, min_fraction=0.0):
     """Build stitched geometry from grid blocks used for density evaluation.
 
-    Each grid cell with fraction > min_fraction is converted to its cell
+    Each grid cell with fraction >= min_fraction is converted to its cell
     rectangle and then stitched via unary_union.
     """
     from shapely.geometry import box
@@ -630,7 +630,7 @@ def _grid_blocks_to_geometry(mapper: TraceGridMapper, min_fraction=0.0):
         y0 = ymin + j * dy
         y1 = y0 + dy
         for i in range(mapper.nx):
-            if mapper.fractions[j, i] > min_fraction:
+            if mapper.fractions[j, i] >= min_fraction:
                 x0 = xmin + i * dx
                 x1 = x0 + dx
                 cells.append(box(x0, y0, x1, y1))
@@ -745,8 +745,15 @@ def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
     Right panel: copper fraction heatmap (grid mapping result)
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    grid_geom = _grid_blocks_to_geometry(mapper, min_fraction=0.0)
-    plot_copper(grid_geom, layer_name=f"{layer.name} (stitched grid blocks)", ax=ax1)
+    # even-odd mode: only keep cells that are judged as interior-filled.
+    # Using 0.5 avoids painting nearly-all cells due to tiny edge overlaps.
+    min_fraction = 0.5 if mapper.even_odd else 0.0
+    grid_geom = _grid_blocks_to_geometry(mapper, min_fraction=min_fraction)
+    plot_copper(
+        grid_geom,
+        layer_name=f"{layer.name} (stitched grid blocks, th={min_fraction:g})",
+        ax=ax1,
+    )
 
     plot_fraction_map(mapper, ax=ax2, title=f"{layer.name} -- Grid Mapping")
     fig.tight_layout()

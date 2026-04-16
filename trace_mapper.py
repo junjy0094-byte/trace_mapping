@@ -513,26 +513,23 @@ class TraceGridMapper:
                 self.fractions[j, i] = min(total_area / cell_area, 1.0)
 
     def _compute_evenodd(self):
-        """Compute fractions using even-odd fill rule per cell.
+        """Compute fractions using per-cell union of copper polygons.
 
-        For each cell, count how many polygons cover each point:
-          - Odd count  → filled  (1 layer, 3+ layers)
-          - Even count → empty   (2-layer hollow interior)
+        For each cell, find all copper polygons that intersect it,
+        compute their intersections with the cell, union them, and
+        measure the resulting copper area.
 
-        Algorithm (fast path for interior cells):
-          1. Polygons fully containing the cell contribute to a parity counter
-             (no geometry ops needed).
-          2. Polygons partially intersecting the cell are XOR'd geometrically
-             within the cell.
-          3. If the parity counter is odd, start from the full cell; otherwise
-             start from empty. Then apply the partial XORs.
+        This approach correctly handles overlapping primitives (pads on
+        traces, trace junctions, etc.) as additive copper via union,
+        avoiding false holes that XOR-based even-odd would create at
+        every 2-layer overlap.
 
-        This allows hollow shapes: drawing a big rect + small rect inside
-        produces a hole (2 overlaps = even = empty), while patterns inside
-        the hole (3 overlaps = odd = filled) stay filled.
+        Uses STRtree spatial index for fast candidate lookup and prepared
+        geometries for fast full-containment checks.
         """
-        from shapely.geometry import box, GeometryCollection
+        from shapely.geometry import box
         from shapely import strtree, prepared
+        from shapely.ops import unary_union
 
         xmin, ymin, xmax, ymax = self.bounds
         dx = (xmax - xmin) / self.nx
@@ -559,9 +556,9 @@ class TraceGridMapper:
                 if len(candidates) == 0:
                     continue
 
-                # Separate fully-containing polygons (fast path) from partial ones
-                contain_count = 0
-                partial_geoms = []
+                # Collect polygon-cell intersections; fast-exit on full coverage
+                intersections = []
+                full_coverage = False
 
                 for idx in candidates:
                     if isinstance(idx, (int, np.integer)):
@@ -572,24 +569,20 @@ class TraceGridMapper:
                         prep = prepared.prep(poly)
 
                     if prep.contains(cell):
-                        # Full containment: no geometry needed, just track parity
-                        contain_count += 1
-                    else:
-                        inter = poly.intersection(cell)
-                        if not inter.is_empty:
-                            partial_geoms.append(inter)
+                        # Any single polygon fully covers this cell → fraction=1
+                        full_coverage = True
+                        break
 
-                # Start from full cell (odd parity) or empty (even parity),
-                # then XOR each partial intersection
-                if contain_count % 2 == 1:
-                    result = cell  # odd containing polys → starts filled
-                else:
-                    result = GeometryCollection()  # even → starts empty
+                    inter = poly.intersection(cell)
+                    if not inter.is_empty:
+                        intersections.append(inter)
 
-                for geom in partial_geoms:
-                    result = result.symmetric_difference(geom)
-
-                self.fractions[j, i] = result.area / cell_area
+                if full_coverage:
+                    self.fractions[j, i] = 1.0
+                elif intersections:
+                    # Union all partial intersections to get true copper area
+                    merged = unary_union(intersections)
+                    self.fractions[j, i] = merged.area / cell_area
 
     def compute(self):
         """Compute copper fraction for each grid cell."""
@@ -741,11 +734,10 @@ def plot_fraction_map(mapper: TraceGridMapper, ax=None, cmap='YlOrRd',
 
 def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
                         color='darkorange'):
-    """Show even-odd copper result derived from already-computed fractions.
+    """Show copper density derived from already-computed fractions.
 
-    Uses the mapper.fractions grid (product of even-odd per-cell computation)
-    to display which cells are filled vs empty.  Cells with fraction > 0 are
-    copper; cells with fraction == 0 are empty (background or even-overlap hole).
+    Uses the mapper.fractions grid to display copper coverage per cell.
+    Fraction value modulates colour intensity: 0 → white, 1 → full copper.
     """
     import matplotlib.colors as mcolors
 
@@ -758,12 +750,14 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
     info = mapper.grid_info
     extent = [info['xmin'], info['xmax'], info['ymin'], info['ymax']]
 
-    # Build two-color image: copper color where fraction > 0, white elsewhere.
+    # Fraction-proportional blending: white (0) → copper colour (1)
     r, g, b, _ = mcolors.to_rgba(color)
-    rgba = np.ones((*mapper.fractions.shape, 4))  # white background
-    mask = mapper.fractions > 0
-    rgba[mask] = [r, g, b, 0.85]       # filled cells → copper color
-    rgba[~mask] = [1.0, 1.0, 1.0, 1.0]  # empty cells  → white
+    rgba = np.ones((*mapper.fractions.shape, 4))  # start white
+    fracs = mapper.fractions
+    rgba[..., 0] = 1.0 - fracs * (1.0 - r)
+    rgba[..., 1] = 1.0 - fracs * (1.0 - g)
+    rgba[..., 2] = 1.0 - fracs * (1.0 - b)
+    rgba[..., 3] = 1.0  # fully opaque
 
     ax.imshow(rgba, origin='lower', extent=extent, aspect='equal',
               interpolation='nearest')
@@ -958,14 +952,239 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
 
 
 # ---------------------------------------------------------------------------
+#  GUI entry point (tkinter)
+# ---------------------------------------------------------------------------
+
+def gui_main():
+    """Launch a simple tkinter GUI for the Gerber Trace Mapper."""
+    import tkinter as tk
+    from tkinter import filedialog, ttk, messagebox
+    import threading
+    import sys
+    import io
+
+    root = tk.Tk()
+    root.title("Gerber Trace Mapper")
+    root.geometry("720x620")
+    root.resizable(True, True)
+
+    # ---- File selection ----
+    file_frame = ttk.LabelFrame(root, text="Gerber Files (.art / .gbr)")
+    file_frame.pack(fill='x', padx=8, pady=(8, 4))
+
+    file_listbox = tk.Listbox(file_frame, height=4, selectmode=tk.EXTENDED)
+    file_listbox.pack(side='left', fill='both', expand=True, padx=(4, 0), pady=4)
+    file_scroll = ttk.Scrollbar(file_frame, orient='vertical',
+                                command=file_listbox.yview)
+    file_scroll.pack(side='left', fill='y', pady=4)
+    file_listbox.config(yscrollcommand=file_scroll.set)
+
+    btn_frame = tk.Frame(file_frame)
+    btn_frame.pack(side='left', padx=4, pady=4)
+
+    def browse_files():
+        paths = filedialog.askopenfilenames(
+            title="Select Gerber files",
+            filetypes=[("Gerber / Artwork", "*.art *.gbr"),
+                       ("All files", "*.*")])
+        for p in paths:
+            if p not in file_listbox.get(0, tk.END):
+                file_listbox.insert(tk.END, p)
+
+    def browse_dir():
+        d = filedialog.askdirectory(title="Select directory containing Gerber files")
+        if d:
+            if d not in file_listbox.get(0, tk.END):
+                file_listbox.insert(tk.END, d)
+
+    def remove_selected():
+        for idx in reversed(file_listbox.curselection()):
+            file_listbox.delete(idx)
+
+    ttk.Button(btn_frame, text="Add Files", command=browse_files).pack(fill='x', pady=1)
+    ttk.Button(btn_frame, text="Add Dir", command=browse_dir).pack(fill='x', pady=1)
+    ttk.Button(btn_frame, text="Remove", command=remove_selected).pack(fill='x', pady=1)
+
+    # ---- Parameters ----
+    param_frame = ttk.LabelFrame(root, text="Grid Parameters")
+    param_frame.pack(fill='x', padx=8, pady=4)
+
+    ttk.Label(param_frame, text="NX:").grid(row=0, column=0, padx=4, pady=2, sticky='e')
+    nx_var = tk.StringVar(value="20")
+    ttk.Entry(param_frame, textvariable=nx_var, width=8).grid(row=0, column=1, padx=4)
+
+    ttk.Label(param_frame, text="NY:").grid(row=0, column=2, padx=4, pady=2, sticky='e')
+    ny_var = tk.StringVar(value="20")
+    ttk.Entry(param_frame, textvariable=ny_var, width=8).grid(row=0, column=3, padx=4)
+
+    ttk.Label(param_frame, text="Merge Tolerance:").grid(
+        row=0, column=4, padx=4, pady=2, sticky='e')
+    tol_var = tk.StringVar(value="0.0")
+    ttk.Entry(param_frame, textvariable=tol_var, width=10).grid(row=0, column=5, padx=4)
+
+    # ---- Output directory ----
+    out_frame = ttk.LabelFrame(root, text="Output Directory (blank = same as input)")
+    out_frame.pack(fill='x', padx=8, pady=4)
+    outdir_var = tk.StringVar(value="")
+    ttk.Entry(out_frame, textvariable=outdir_var).pack(
+        side='left', fill='x', expand=True, padx=4, pady=4)
+
+    def browse_outdir():
+        d = filedialog.askdirectory(title="Select output directory")
+        if d:
+            outdir_var.set(d)
+
+    ttk.Button(out_frame, text="Browse", command=browse_outdir).pack(
+        side='left', padx=4, pady=4)
+
+    # ---- Options ----
+    opt_frame = ttk.LabelFrame(root, text="Options")
+    opt_frame.pack(fill='x', padx=8, pady=4)
+
+    even_odd_var = tk.BooleanVar(value=True)
+    no_merge_var = tk.BooleanVar(value=False)
+    interactive_var = tk.BooleanVar(value=False)
+    shared_bounds_var = tk.BooleanVar(value=True)
+    export_csv_var = tk.BooleanVar(value=True)
+    plot_var = tk.BooleanVar(value=True)
+    show_var = tk.BooleanVar(value=True)
+
+    ttk.Checkbutton(opt_frame, text="Even-Odd fill", variable=even_odd_var).grid(
+        row=0, column=0, padx=6, pady=2, sticky='w')
+    ttk.Checkbutton(opt_frame, text="No Merge", variable=no_merge_var).grid(
+        row=0, column=1, padx=6, pady=2, sticky='w')
+    ttk.Checkbutton(opt_frame, text="Interactive exclude", variable=interactive_var).grid(
+        row=0, column=2, padx=6, pady=2, sticky='w')
+    ttk.Checkbutton(opt_frame, text="Shared bounds", variable=shared_bounds_var).grid(
+        row=1, column=0, padx=6, pady=2, sticky='w')
+    ttk.Checkbutton(opt_frame, text="Export CSV", variable=export_csv_var).grid(
+        row=1, column=1, padx=6, pady=2, sticky='w')
+    ttk.Checkbutton(opt_frame, text="Generate plots", variable=plot_var).grid(
+        row=1, column=2, padx=6, pady=2, sticky='w')
+    ttk.Checkbutton(opt_frame, text="Show plots", variable=show_var).grid(
+        row=1, column=3, padx=6, pady=2, sticky='w')
+
+    # ---- Log output ----
+    log_frame = ttk.LabelFrame(root, text="Log")
+    log_frame.pack(fill='both', expand=True, padx=8, pady=4)
+    log_text = tk.Text(log_frame, height=12, state='disabled', wrap='word')
+    log_text.pack(fill='both', expand=True, padx=4, pady=4)
+    log_scroll = ttk.Scrollbar(log_text, orient='vertical', command=log_text.yview)
+    log_scroll.pack(side='right', fill='y')
+    log_text.config(yscrollcommand=log_scroll.set)
+
+    def log(msg):
+        log_text.config(state='normal')
+        log_text.insert(tk.END, msg)
+        log_text.see(tk.END)
+        log_text.config(state='disabled')
+        root.update_idletasks()
+
+    # ---- Run button ----
+    run_frame = tk.Frame(root)
+    run_frame.pack(fill='x', padx=8, pady=(0, 8))
+
+    def run_processing():
+        paths = list(file_listbox.get(0, tk.END))
+        if not paths:
+            messagebox.showwarning("No files", "Please add at least one Gerber file.")
+            return
+
+        try:
+            nx = int(nx_var.get())
+            ny = int(ny_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid", "NX and NY must be integers.")
+            return
+        try:
+            merge_tol = float(tol_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid", "Merge tolerance must be a number.")
+            return
+
+        outdir = outdir_var.get().strip() or None
+        run_btn.config(state='disabled')
+
+        def worker():
+            # Redirect stdout to log widget
+            old_stdout = sys.stdout
+            sys.stdout = _LogWriter(log)
+            try:
+                files = collect_art_files(paths)
+                if not files:
+                    log("No Gerber files found in the given paths.\n")
+                    return
+                log(f"Found {len(files)} Gerber file(s)\n")
+
+                results = process_layers(
+                    filepaths=files,
+                    nx=nx, ny=ny,
+                    shared_bounds=shared_bounds_var.get(),
+                    export_csv=export_csv_var.get(),
+                    plot=plot_var.get(),
+                    show=False,   # we call plt.show() ourselves below
+                    outdir=outdir,
+                    merge_tolerance=merge_tol,
+                    no_merge=no_merge_var.get(),
+                    interactive=interactive_var.get(),
+                    even_odd=even_odd_var.get(),
+                )
+
+                # Summary
+                log("\n=== Summary ===\n")
+                for name, mapper in results.items():
+                    info = mapper.grid_info
+                    log(f"  {name}: {info['nx']}x{info['ny']} grid, "
+                        f"avg Cu = {mapper.fractions.mean():.4f}, "
+                        f"max = {mapper.fractions.max():.4f}\n")
+
+                if show_var.get() and results:
+                    log("Displaying plots...\n")
+                    plt.show()
+
+                log("Done.\n")
+            except Exception as e:
+                log(f"\nERROR: {e}\n")
+                import traceback
+                log(traceback.format_exc())
+            finally:
+                sys.stdout = old_stdout
+                run_btn.config(state='normal')
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    run_btn = ttk.Button(run_frame, text="Run", command=run_processing)
+    run_btn.pack(side='left', padx=4)
+    ttk.Button(run_frame, text="Quit", command=root.destroy).pack(side='right', padx=4)
+
+    root.mainloop()
+
+
+class _LogWriter:
+    """Redirect print() output to a callback function."""
+    def __init__(self, callback):
+        self._cb = callback
+
+    def write(self, text):
+        if text:
+            self._cb(text)
+
+    def flush(self):
+        pass
+
+
+# ---------------------------------------------------------------------------
 #  CLI entry point
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
         description='Gerber Trace Mapping: compute copper fraction on NxM grid')
-    parser.add_argument('paths', nargs='+',
-                        help='Gerber file(s) and/or directories containing .art/.gbr')
+    parser.add_argument('paths', nargs='*',
+                        help='Gerber file(s) and/or directories containing .art/.gbr '
+                             '(omit to launch GUI)')
+    parser.add_argument('--gui', action='store_true',
+                        help='Launch graphical user interface')
     parser.add_argument('--nx', type=int, default=20, help='Grid X divisions (default: 20)')
     parser.add_argument('--ny', type=int, default=20, help='Grid Y divisions (default: 20)')
     parser.add_argument('--no-shared-bounds', action='store_true',
@@ -1004,6 +1223,12 @@ def main():
              'Use this only if hollow shapes are not needed.')
 
     args = parser.parse_args()
+
+    # If no files given (or --gui flag), launch GUI
+    if not args.paths or args.gui:
+        gui_main()
+        return
+
     use_even_odd = not args.no_even_odd
 
     files = collect_art_files(args.paths)
@@ -1012,7 +1237,7 @@ def main():
         print(f"  {f}")
 
     if use_even_odd:
-        print("\nMode: EVEN-ODD (hollow shapes: 2 overlaps=hole, 3+overlaps=filled)")
+        print("\nMode: EVEN-ODD (per-cell union with spatial index)")
     elif args.no_merge:
         print("\nMode: NO-MERGE (individual polygons, area sum, STRtree spatial index)")
     elif args.merge_tolerance > 0:

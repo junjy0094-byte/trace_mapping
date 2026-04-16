@@ -414,7 +414,6 @@ class TraceGridMapper:
     bounds: Optional[Tuple[float, float, float, float]] = None
     even_odd: bool = False
     fractions: np.ndarray = field(default=None, repr=False)
-    raster: np.ndarray = field(default=None, repr=False)
 
     def __post_init__(self):
         if self.bounds is None:
@@ -507,9 +506,6 @@ class TraceGridMapper:
             sampled = (grid % 2 == 1).astype(np.float64)
         else:
             sampled = grid.astype(np.float64)
-
-        # Keep full-resolution raster for visualisation
-        self.raster = sampled
 
         self.fractions = sampled.reshape(
             self.ny, SUB, self.nx, SUB
@@ -693,60 +689,58 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
     return ax
 
 
-def plot_grid_copper(mapper: TraceGridMapper, layer_name="", ax=None,
-                     color='gold'):
-    """Plot the high-resolution rasterised copper with grid overlay.
-
-    Displays the full sub-pixel raster produced during computation
-    (after even-odd or union processing) so that the actual copper
-    shapes are visible at high fidelity.  The NxM grid lines are drawn
-    on top to show how the area is partitioned for density calculation.
-    """
-    import matplotlib.colors as mcolors
-
-    if ax is None:
-        _, ax = plt.subplots(1, 1, figsize=(10, 8))
-
-    if mapper.raster is None:
-        mapper.compute()
-
-    info = mapper.grid_info
-    extent = [info['xmin'], info['xmax'], info['ymin'], info['ymax']]
-
-    # Build RGBA image from the high-res raster
-    r, g, b, _ = mcolors.to_rgba(color)
-    rgba = np.ones((*mapper.raster.shape, 4))  # white background
-    mask = mapper.raster > 0
-    rgba[mask] = [r, g, b, 1.0]       # copper pixels → gold/yellow
-    rgba[~mask] = [1.0, 1.0, 1.0, 1.0]  # empty pixels  → white
-
-    ax.imshow(rgba, origin='lower', extent=extent, aspect='equal',
-              interpolation='nearest')
-
-    # Overlay NxM grid lines
-    for i in range(mapper.nx + 1):
-        x = info['xmin'] + i * info['dx']
-        ax.axvline(x, color='gray', lw=0.3, alpha=0.5)
-    for j in range(mapper.ny + 1):
-        y = info['ymin'] + j * info['dy']
-        ax.axhline(y, color='gray', lw=0.3, alpha=0.5)
-
-    ax.set_aspect('equal')
-    ax.set_title(f"Cu Raster: {layer_name}  ({mapper.nx}×{mapper.ny} grid)")
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    return ax
-
-
 def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
-    """Side-by-side: grid copper map vs fraction heatmap.
+    """Side-by-side: copper polygons with grid overlay vs fraction heatmap.
 
-    Left panel : grid-based binary copper (gold = Cu, white = empty)
+    Left panel : original copper polygons (gold) with NxM grid lines
     Right panel: copper fraction heatmap (grid mapping result)
     """
+    from shapely.geometry import MultiPolygon, Polygon as ShapelyPolygon
+
+    if mapper.fractions is None:
+        mapper.compute()
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    plot_grid_copper(mapper, layer_name=layer.name, ax=ax1)
+
+    # --- Left panel: original polygons + grid overlay ---
+    # Draw copper polygons
+    if layer.copper is not None:
+        geom = layer.copper
+        if isinstance(geom, MultiPolygon):
+            polys = list(geom.geoms)
+        else:
+            polys = [geom]
+    else:
+        polys = layer.copper_polys
+
+    for poly in polys:
+        if not isinstance(poly, ShapelyPolygon):
+            continue
+        x, y = poly.exterior.xy
+        ax1.fill(x, y, fc='gold', ec='none', alpha=0.9)
+        for interior in poly.interiors:
+            ix, iy = interior.xy
+            ax1.fill(ix, iy, fc='white', ec='none', alpha=1.0)
+
+    # Draw grid lines on top
+    info = mapper.grid_info
+    for i in range(mapper.nx + 1):
+        x = info['xmin'] + i * info['dx']
+        ax1.axvline(x, color='gray', lw=0.3, alpha=0.5)
+    for j in range(mapper.ny + 1):
+        y = info['ymin'] + j * info['dy']
+        ax1.axhline(y, color='gray', lw=0.3, alpha=0.5)
+
+    ax1.set_xlim(info['xmin'], info['xmax'])
+    ax1.set_ylim(info['ymin'], info['ymax'])
+    ax1.set_aspect('equal')
+    ax1.set_title(f"Copper: {layer.name}  ({mapper.nx}×{mapper.ny} grid)")
+    ax1.set_xlabel('X')
+    ax1.set_ylabel('Y')
+
+    # --- Right panel: fraction heatmap ---
     plot_fraction_map(mapper, ax=ax2, title=f"{layer.name} -- Grid Mapping")
+
     fig.tight_layout()
     return fig
 

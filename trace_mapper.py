@@ -596,17 +596,18 @@ class TraceGridMapper:
 def _get_geometry_used_for_mapping(mapper: TraceGridMapper):
     """Build display geometry from the same polygon set/rule used in mapping.
 
-    - even_odd=True  : XOR (symmetric_difference) across mapper.copper_polys
+    - even_odd=True  : return None (use computed grid-mask view for speed)
     - merged mode    : use mapper.copper directly
     - individual mode: OR union across mapper.copper_polys
     """
     from shapely.ops import unary_union
 
-    if mapper.even_odd and mapper.copper_polys:
-        geom = None
-        for poly in mapper.copper_polys:
-            geom = poly if geom is None else geom.symmetric_difference(poly)
-        return geom
+    # NOTE:
+    # Exact polygon XOR across many shapes can be very expensive and caused
+    # PNG export to stall for large datasets. In even-odd mode, we therefore
+    # render from already-computed grid fractions instead (see plot_comparison).
+    if mapper.even_odd:
+        return None
 
     if mapper.copper is not None:
         return mapper.copper
@@ -714,12 +715,19 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
 def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
     """Side-by-side: raw copper artwork vs fraction heatmap.
 
-    Left panel : geometry reconstructed from polygons/rule used in mapping
+    Left panel : mapping-source view (fast path for even-odd uses grid mask)
     Right panel: copper fraction heatmap (grid mapping result)
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    mapping_geom = _get_geometry_used_for_mapping(mapper)
-    plot_copper(mapping_geom, layer_name=layer.name, ax=ax1)
+
+    # even-odd mode: avoid expensive polygon XOR; reuse computed fractions
+    # for responsive PNG export.
+    if mapper.even_odd:
+        plot_evenodd_copper(mapper, layer_name=f"{layer.name} (from grid)", ax=ax1)
+    else:
+        mapping_geom = _get_geometry_used_for_mapping(mapper)
+        plot_copper(mapping_geom, layer_name=layer.name, ax=ax1)
+
     plot_fraction_map(mapper, ax=ax2, title=f"{layer.name} -- Grid Mapping")
     fig.tight_layout()
     return fig

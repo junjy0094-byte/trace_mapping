@@ -433,6 +433,50 @@ class TraceGridMapper:
             else:
                 raise ValueError("Either copper or copper_polys must be provided")
 
+    def _fractions_from_bitmap(self):
+        """Block-average ``self._raster_bitmap`` into the ``ny × nx`` density
+        grid, using a summed-area-table so arbitrary (bitmap-H, bitmap-W)
+        shapes work even when they are not evenly divisible by (ny, nx).
+
+        Called directly on cache hits (where ``_raster_bitmap`` already exists)
+        and also for the fast-path where nx/ny changed but the raster didn't.
+        """
+        bitmap = self._raster_bitmap
+        if bitmap is None:
+            raise RuntimeError("no raster bitmap available")
+        H, W = bitmap.shape
+
+        # Auto-detect SUB (when bitmap came from cache without a recorded SUB).
+        if self._raster_sub <= 0 and self.nx > 0 and self.ny > 0:
+            if H % self.ny == 0 and W % self.nx == 0 \
+                    and (H // self.ny) == (W // self.nx):
+                self._raster_sub = H // self.ny
+
+        # Fast path: bitmap is an exact (ny*SUB, nx*SUB) tiling.
+        if self._raster_sub > 0 and H == self.ny * self._raster_sub \
+                and W == self.nx * self._raster_sub:
+            S = self._raster_sub
+            self.fractions = bitmap.astype(np.float64).reshape(
+                self.ny, S, self.nx, S
+            ).mean(axis=(1, 3))
+            return
+
+        # General path: summed-area-table on integer image, fully vectorised.
+        ii = np.zeros((H + 1, W + 1), dtype=np.int64)
+        ii[1:, 1:] = bitmap.astype(np.int64).cumsum(axis=0).cumsum(axis=1)
+
+        xs_i = np.linspace(0, W, self.nx + 1).round().astype(np.int64)
+        ys_i = np.linspace(0, H, self.ny + 1).round().astype(np.int64)
+        x0s, x1s = xs_i[:-1], xs_i[1:]
+        y0s, y1s = ys_i[:-1], ys_i[1:]
+
+        sums = (ii[np.ix_(y1s, x1s)] - ii[np.ix_(y0s, x1s)]
+                - ii[np.ix_(y1s, x0s)] + ii[np.ix_(y0s, x0s)])
+        areas = (y1s - y0s)[:, None] * (x1s - x0s)[None, :]
+        fractions = np.zeros_like(sums, dtype=np.float64)
+        np.divide(sums, areas, out=fractions, where=areas > 0)
+        self.fractions = fractions
+
     def _compute_raster(self, mode):
         """Fast grid computation using point-sampling rasterisation.
 
@@ -547,6 +591,19 @@ class TraceGridMapper:
             raise ValueError(f"Invalid grid: bounds={self.bounds}, nx={self.nx}, ny={self.ny}")
 
         total = self.nx * self.ny
+
+        # Fast path: a cached raster was already injected (load_cache / direct
+        # assignment); just derive per-cell fractions for current nx/ny.
+        if self._raster_bitmap is not None and not (self.copper_polys or self.copper):
+            t0 = time.time()
+            self._fractions_from_bitmap()
+            elapsed = time.time() - t0
+            nonzero = np.count_nonzero(self.fractions)
+            print(f"Reused cached raster {self._raster_bitmap.shape} → "
+                  f"{self.nx}x{self.ny} cells in {elapsed:.2f}s  |  "
+                  f"non-zero: {nonzero}/{total}  |  "
+                  f"avg fraction: {self.fractions.mean():.4f}")
+            return self.fractions
 
         if self.even_odd:
             if not self.copper_polys:
@@ -829,12 +886,75 @@ def compute_shared_bounds(layers: List[GerberLayer]):
     return (xmin, ymin, xmax, ymax)
 
 
+# ---------------------------------------------------------------------------
+#  Raster cache: reuse sub-pixel bitmaps across nx/ny re-runs.
+#
+#  The cache stores the post-custom-XOR bitmap (NOT per-cell fractions) so
+#  the user can resample onto any (nx, ny) grid instantly via a summed-area
+#  table.  Cache hits skip the entire Gerber parse + rasterisation phase.
+# ---------------------------------------------------------------------------
+
+CACHE_VERSION = 1
+CACHE_DIRNAME = ".trace_cache"
+
+
+def _raster_cache_key(filepath: str, params: dict) -> Tuple[str, dict]:
+    """Return (hash, canonical-params). Hash covers file identity + every
+    parameter that affects the rasterised bitmap (but NOT nx/ny)."""
+    import hashlib, json, os
+    st = os.stat(filepath)
+    canon = {
+        'file': os.path.abspath(filepath),
+        'mtime_ns': st.st_mtime_ns,
+        'size': st.st_size,
+        'v': CACHE_VERSION,
+        **params,
+    }
+    blob = json.dumps(canon, sort_keys=True, default=str).encode()
+    return hashlib.sha1(blob).hexdigest()[:12], canon
+
+
+def _raster_cache_path(filepath: str, key_hash: str, outdir=None) -> Path:
+    stem = Path(filepath).stem
+    root = Path(outdir) if outdir else Path(filepath).parent
+    return root / CACHE_DIRNAME / f"{stem}_{key_hash}.npz"
+
+
+def _save_raster_cache(path: Path, bitmap: np.ndarray,
+                       bounds: Tuple[float, float, float, float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # uint8 halves disk / mem vs bool (which numpy stores as 1 byte anyway,
+    # but uint8 is unambiguous across numpy versions).
+    np.savez_compressed(
+        path,
+        version=np.int32(CACHE_VERSION),
+        bitmap=bitmap.astype(np.uint8),
+        bounds=np.array(bounds, dtype=np.float64),
+    )
+
+
+def _load_raster_cache(path: Path):
+    """Return (bitmap_bool, bounds_tuple) or None if missing/corrupt."""
+    if not path.exists():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as d:
+            if int(d['version']) != CACHE_VERSION:
+                return None
+            bitmap = d['bitmap'].astype(bool)
+            bounds = tuple(d['bounds'].tolist())
+            return bitmap, bounds
+    except Exception as e:
+        print(f"  Cache read failed ({path.name}): {e}")
+        return None
+
+
 def process_layers(filepaths: List[str], nx=20, ny=20,
                    bounds=None, shared_bounds=True,
                    export_csv=True, plot=True, show=False, outdir=None,
                    merge_tolerance=0.0, no_merge=False, interactive=False,
                    even_odd=True, exclude_largest=0,
-                   min_display_pixels=600):
+                   min_display_pixels=600, cache=True):
     """
     Process multiple Gerber layer files.
 
@@ -852,6 +972,11 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                   Enables hollow shapes: big rect + small rect inside = hole.
         exclude_largest: Number of largest polygons (by area) to exclude per layer.
                          Useful for removing outer board-outline polygons. 0 = none.
+        cache: If True (default), reuse cached sub-pixel rasters keyed on
+               file content + all rasterisation params (EXCLUDING nx/ny).
+               Lets you change nx/ny and get instant re-mapping from a
+               previously rendered bitmap.  Disabled automatically in
+               ``interactive`` mode.
     Returns:
         dict: {layer_name: TraceGridMapper}
     """
@@ -859,12 +984,23 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         print("No files to process.")
         return {}
 
-    # --- Step 1: Load & parse all layers ---
-    # When even_odd mode is active we only need individual polygons,
-    # so skip the expensive unary_union merge entirely.
     skip_merge = no_merge or even_odd
-    layers: List[GerberLayer] = []
-    for fp in filepaths:
+    cache_enabled = cache and not interactive
+
+    # Polygon-affecting subset of params: these feed BOTH the meta cache
+    # (own bounds after filtering) and the raster cache (bitmap).
+    poly_params = {
+        'merge_tolerance': merge_tolerance,
+        'no_merge': skip_merge,
+        'even_odd': even_odd,
+        'exclude_largest': exclude_largest,
+    }
+    raster_params = {
+        **poly_params,
+        'min_display_pixels': min_display_pixels,
+    }
+
+    def _parse_layer(fp: str) -> Optional[GerberLayer]:
         try:
             layer = GerberLayer(filepath=fp,
                                 merge_tolerance=merge_tolerance,
@@ -872,98 +1008,162 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                                 interactive=interactive)
             layer.load()
             layer.to_polygons()
-            layers.append(layer)
+            if exclude_largest > 0 and layer.copper_polys:
+                layer._copper_polys = _exclude_largest_polygons(
+                    layer.copper_polys, exclude_largest)
+            return layer
         except Exception as e:
             print(f"  ERROR loading {fp}: {e}")
+            return None
 
-    if not layers:
+    # --- Step 1: Determine each file's own bounds ---------------------------
+    # Try the meta cache first (params + file mtime/size).  On hit, skip the
+    # Gerber parse entirely for now and defer to Step 3 if we end up needing
+    # polygons (raster cache miss).
+    parsed: dict = {}            # fp -> GerberLayer (if already parsed)
+    own_bounds: dict = {}        # fp -> (xmin, ymin, xmax, ymax)
+
+    for fp in filepaths:
+        ob = None
+        if cache_enabled:
+            meta_hash, _ = _raster_cache_key(fp, {**poly_params, 'kind': 'meta'})
+            meta_path = _raster_cache_path(fp, 'meta_' + meta_hash, outdir)
+            if meta_path.exists():
+                try:
+                    with np.load(meta_path, allow_pickle=False) as d:
+                        ob = tuple(d['bounds'].tolist())
+                        print(f"  Meta cache hit: {Path(fp).name}  bounds={ob}")
+                except Exception:
+                    ob = None
+        if ob is None:
+            layer = _parse_layer(fp)
+            if layer is None:
+                continue
+            ob = layer.bounds
+            parsed[fp] = layer
+            if cache_enabled:
+                meta_hash, _ = _raster_cache_key(fp, {**poly_params, 'kind': 'meta'})
+                meta_path = _raster_cache_path(fp, 'meta_' + meta_hash, outdir)
+                meta_path.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(meta_path, bounds=np.array(ob, dtype=np.float64))
+        own_bounds[fp] = ob
+
+    if not own_bounds:
         print("No layers loaded successfully.")
         return {}
 
-    # --- Step 2: Determine bounds ---
+    # --- Step 2: Determine effective bounds per layer -----------------------
     if bounds is not None:
-        unified_bounds = bounds
-        print(f"\nUsing user-specified bounds: {unified_bounds}")
-    elif shared_bounds and len(layers) > 1:
-        unified_bounds = compute_shared_bounds(layers)
-        print(f"\nShared bounds across {len(layers)} layers: {unified_bounds}")
+        effective = {fp: bounds for fp in own_bounds}
+        print(f"\nUsing user-specified bounds: {bounds}")
+    elif shared_bounds and len(own_bounds) > 1:
+        all_b = list(own_bounds.values())
+        sb = (min(b[0] for b in all_b), min(b[1] for b in all_b),
+              max(b[2] for b in all_b), max(b[3] for b in all_b))
+        effective = {fp: sb for fp in own_bounds}
+        print(f"\nShared bounds across {len(own_bounds)} layers: {sb}")
     else:
-        unified_bounds = None
+        effective = dict(own_bounds)
 
-    # --- Step 3: Compute grid fractions for each layer ---
+    # --- Step 3: Per-layer raster (from cache or fresh) + fractions --------
     results = {}
     if outdir:
         Path(outdir).mkdir(parents=True, exist_ok=True)
 
-    for layer in layers:
-        b = unified_bounds if unified_bounds else None
+    for fp, eff_b in effective.items():
+        name = Path(fp).stem
 
-        # Exclude largest polygons (e.g. board outline) if requested
-        if exclude_largest > 0 and layer.copper_polys:
-            layer._copper_polys = _exclude_largest_polygons(
-                layer.copper_polys, exclude_largest)
+        raster_params_fp = {**raster_params,
+                            'bounds': tuple(round(v, 9) for v in eff_b)}
+        bitmap = cached_bounds = None
+        if cache_enabled:
+            r_hash, _ = _raster_cache_key(fp, raster_params_fp)
+            r_path = _raster_cache_path(fp, r_hash, outdir)
+            loaded = _load_raster_cache(r_path)
+            if loaded is not None:
+                bitmap, cached_bounds = loaded
+                print(f"  Raster cache hit: {name}  bitmap={bitmap.shape}")
 
-        # Create mapper with appropriate mode
-        if even_odd:
-            # Even-odd fill rule: hollow shapes supported, fast per-cell XOR.
-            # Requires individual polygons (no global merge).
-            mapper = TraceGridMapper(
-                copper_polys=layer.copper_polys,
-                nx=nx, ny=ny, bounds=b,
-                even_odd=True,
-                min_display_pixels=min_display_pixels,
-            )
-        elif layer.no_merge or layer.copper is None:
-            mapper = TraceGridMapper(
-                copper_polys=layer.copper_polys,
-                nx=nx, ny=ny, bounds=b,
-                min_display_pixels=min_display_pixels,
-            )
+        if bitmap is None:
+            # Need polygons + rasterization
+            layer = parsed.get(fp) or _parse_layer(fp)
+            if layer is None:
+                continue
+            parsed[fp] = layer
+
+            if even_odd:
+                mapper = TraceGridMapper(
+                    copper_polys=layer.copper_polys,
+                    nx=nx, ny=ny, bounds=eff_b,
+                    even_odd=True,
+                    min_display_pixels=min_display_pixels,
+                )
+            elif layer.no_merge or layer.copper is None:
+                mapper = TraceGridMapper(
+                    copper_polys=layer.copper_polys,
+                    nx=nx, ny=ny, bounds=eff_b,
+                    min_display_pixels=min_display_pixels,
+                )
+            else:
+                mapper = TraceGridMapper(
+                    copper=layer.copper,
+                    nx=nx, ny=ny, bounds=eff_b,
+                    min_display_pixels=min_display_pixels,
+                )
+            mapper.compute()
+
+            if cache_enabled:
+                _save_raster_cache(r_path, mapper._raster_bitmap, eff_b)
+                print(f"  Raster cache saved: {r_path.name}")
         else:
+            # Cache hit path: create empty mapper, inject bitmap, derive fractions.
             mapper = TraceGridMapper(
-                copper=layer.copper,
-                nx=nx, ny=ny, bounds=b,
+                nx=nx, ny=ny, bounds=cached_bounds,
+                even_odd=even_odd,
                 min_display_pixels=min_display_pixels,
             )
+            mapper._raster_bitmap = bitmap
+            mapper.compute()
 
-        mapper.compute()
-
-        # Determine output path
-        stem = Path(layer.filepath).stem
-        out_base = Path(outdir) if outdir else Path(layer.filepath).parent
+        stem = Path(fp).stem
+        out_base = Path(outdir) if outdir else Path(fp).parent
 
         if export_csv:
             csv_path = out_base / f"{stem}.csv"
             mapper.to_csv(str(csv_path))
 
         if plot:
-            fig = plot_comparison(layer, mapper)
+            stub = parsed.get(fp) or type('LayerStub', (), {
+                'name': name, 'filepath': fp,
+            })()
+            fig = plot_comparison(stub, mapper)
             png_path = out_base / f"{stem}.png"
             fig.savefig(str(png_path), dpi=150, bbox_inches='tight')
             if not show:
                 plt.close(fig)
             print(f"Plot saved: {png_path}")
 
-        results[layer.name] = mapper
+        results[name] = mapper
 
     # --- Step 4: All-layer summary plot ---
-    if plot and len(layers) > 1:
-        n = len(layers)
+    if plot and len(results) > 1:
+        n = len(results)
         cols = min(n, 4)
         rows = (n + cols - 1) // cols
         fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows))
         axes = np.atleast_1d(axes).flatten()
 
-        for idx, layer in enumerate(layers):
-            plot_fraction_map(results[layer.name], ax=axes[idx],
-                              title=layer.name, show_grid=(nx <= 30))
-        for idx in range(len(layers), len(axes)):
+        for idx, (name, mp) in enumerate(results.items()):
+            plot_fraction_map(mp, ax=axes[idx],
+                              title=name, show_grid=(nx <= 30))
+        for idx in range(len(results), len(axes)):
             axes[idx].set_visible(False)
 
         fig.suptitle(f"All Layers -- {nx}x{ny} Grid", fontsize=14)
         fig.tight_layout()
+        first_fp = next(iter(effective.keys()))
         summary_path = (Path(outdir) if outdir
-                        else Path(layers[0].filepath).parent) / "all_layers_summary.png"
+                        else Path(first_fp).parent) / "all_layers_summary.png"
         fig.savefig(str(summary_path), dpi=150, bbox_inches='tight')
         if not show:
             plt.close(fig)
@@ -1102,6 +1302,10 @@ def gui_main():
     ttk.Spinbox(ef, from_=1, to=20, textvariable=exclude_n_var,
                 width=4).pack(side='left', padx=2)
 
+    cache_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(opt_frame, text="Use raster cache", variable=cache_var).grid(
+        row=2, column=2, padx=6, pady=2, sticky='w')
+
     # ---- Log output ----
     log_frame = ttk.LabelFrame(root, text="Log")
     log_frame.pack(fill='both', expand=True, padx=8, pady=4)
@@ -1111,12 +1315,21 @@ def gui_main():
     log_scroll.pack(side='right', fill='y')
     log_text.config(yscrollcommand=log_scroll.set)
 
-    def log(msg):
+    # ``log`` is safe to call from any thread: it marshals to the Tk main
+    # thread via ``root.after(0, ...)``.  Previously calling it from the
+    # worker thread triggered "main thread is not in main loop" errors.
+    def _append_log(msg: str):
         log_text.config(state='normal')
         log_text.insert(tk.END, msg)
         log_text.see(tk.END)
         log_text.config(state='disabled')
-        root.update_idletasks()
+
+    def log(msg):
+        try:
+            root.after(0, lambda m=msg: _append_log(m))
+        except RuntimeError:
+            # Tk already torn down; drop the message silently.
+            pass
 
     # ---- Run button ----
     run_frame = tk.Frame(root)
@@ -1152,9 +1365,20 @@ def gui_main():
                 excl_n = int(exclude_n_var.get())
             except ValueError:
                 excl_n = 1
-        run_btn.config(state='disabled')
+        # Snapshot EVERY Tk variable on the main thread; Tk is not
+        # thread-safe and reading vars from the worker triggers
+        # "main thread is not in main loop".
+        opts = {
+            'shared_bounds': shared_bounds_var.get(),
+            'export_csv': export_csv_var.get(),
+            'no_merge': no_merge_var.get(),
+            'interactive': interactive_var.get(),
+            'even_odd': even_odd_var.get(),
+            'cache': cache_var.get(),
+        }
         do_plot = plot_var.get()
         do_show = show_var.get()
+        run_btn.config(state='disabled')
 
         def worker():
             # Redirect stdout to log widget
@@ -1171,17 +1395,18 @@ def gui_main():
                 results = process_layers(
                     filepaths=files,
                     nx=nx, ny=ny,
-                    shared_bounds=shared_bounds_var.get(),
-                    export_csv=export_csv_var.get(),
+                    shared_bounds=opts['shared_bounds'],
+                    export_csv=opts['export_csv'],
                     plot=False,
                     show=False,
                     outdir=outdir,
                     merge_tolerance=merge_tol,
-                    no_merge=no_merge_var.get(),
-                    interactive=interactive_var.get(),
-                    even_odd=even_odd_var.get(),
+                    no_merge=opts['no_merge'],
+                    interactive=opts['interactive'],
+                    even_odd=opts['even_odd'],
                     exclude_largest=excl_n,
                     min_display_pixels=disp_pix,
+                    cache=opts['cache'],
                 )
 
                 # Summary
@@ -1243,8 +1468,31 @@ def gui_main():
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def clear_cache():
+        """Delete every .trace_cache entry next to the listed files or in outdir."""
+        import shutil
+        roots = set()
+        od = outdir_var.get().strip()
+        if od:
+            roots.add(Path(od))
+        for p in file_listbox.get(0, tk.END):
+            pp = Path(p)
+            roots.add(pp if pp.is_dir() else pp.parent)
+        removed = 0
+        for r in roots:
+            c = r / CACHE_DIRNAME
+            if c.exists():
+                try:
+                    shutil.rmtree(c)
+                    removed += 1
+                except Exception as e:
+                    log(f"  Failed to remove {c}: {e}\n")
+        log(f"Cleared cache in {removed} location(s)\n")
+
     run_btn = ttk.Button(run_frame, text="Run", command=run_processing)
     run_btn.pack(side='left', padx=4)
+    ttk.Button(run_frame, text="Clear Cache", command=clear_cache).pack(
+        side='left', padx=4)
     ttk.Button(run_frame, text="Quit", command=root.destroy).pack(side='right', padx=4)
 
     root.mainloop()
@@ -1320,6 +1568,15 @@ def main():
         help='Minimum sub-pixel raster size per axis for the left-panel '
              'display (default: 600). Larger = sharper detail, slower '
              '(cost ~quadratic). e.g. 1200, 2000, 4000.')
+    parser.add_argument(
+        '--no-cache', action='store_true',
+        help='Disable reuse of cached sub-pixel rasters. By default, the '
+             'raster (NOT nx/ny) is cached per file so changing nx/ny '
+             'recomputes density instantly from the same bitmap.')
+    parser.add_argument(
+        '--clear-cache', action='store_true',
+        help='Delete the .trace_cache directory next to each input path '
+             '(or in --outdir) before running.')
 
     args = parser.parse_args()
 
@@ -1334,6 +1591,17 @@ def main():
     print(f"\nFound {len(files)} Gerber file(s):")
     for f in files:
         print(f"  {f}")
+
+    if args.clear_cache:
+        import shutil
+        roots = {Path(args.outdir)} if args.outdir else set()
+        roots.update(Path(p).parent if Path(p).is_file() else Path(p)
+                     for p in args.paths)
+        for r in roots:
+            c = r / CACHE_DIRNAME
+            if c.exists():
+                shutil.rmtree(c)
+                print(f"Cleared cache: {c}")
 
     if use_even_odd:
         print("\nMode: EVEN-ODD (per-cell union with spatial index)")
@@ -1359,6 +1627,7 @@ def main():
         even_odd=use_even_odd,
         exclude_largest=args.exclude_largest,
         min_display_pixels=args.display_pixels,
+        cache=not args.no_cache,
     )
 
     if args.show:

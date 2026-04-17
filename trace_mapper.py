@@ -414,6 +414,8 @@ class TraceGridMapper:
     bounds: Optional[Tuple[float, float, float, float]] = None
     even_odd: bool = False
     fractions: np.ndarray = field(default=None, repr=False)
+    _raster_bitmap: np.ndarray = field(default=None, repr=False)
+    _raster_sub: int = field(default=0, repr=False)
 
     def __post_init__(self):
         if self.bounds is None:
@@ -430,20 +432,30 @@ class TraceGridMapper:
             else:
                 raise ValueError("Either copper or copper_polys must be provided")
 
+    MIN_DISPLAY_PIXELS = 600  # min raster resolution per axis (for left-plot)
+
     def _compute_raster(self, mode):
         """Fast grid computation using point-sampling rasterisation.
 
-        Instead of expensive Shapely polygon-polygon intersection per cell,
-        creates a fine sub-pixel grid and tests point-in-polygon with
-        matplotlib Path (C-optimised).  The sub-pixel bitmap is then
-        block-averaged to produce the per-cell copper fraction.
+        Builds one sub-pixel bitmap and derives two outputs:
+
+        * ``self._raster_bitmap`` — boolean image after the custom XOR rule,
+          re-used by ``plot_comparison`` for the left panel (no second pass
+          over the polygons, no polygon-level symmetric_difference).
+        * ``self.fractions`` — per-cell density (block-averaged from the
+          bitmap) used by the right-panel heat map.
+
+        Sub-pixel count (``SUB``) is chosen so the resulting bitmap has at
+        least ``MIN_DISPLAY_PIXELS`` per axis, giving a sharp left-panel
+        display without a separate render pass.  A floor of 5 keeps the
+        density estimate accurate even for very coarse grids.
 
         mode: 'even-odd' | 'merged' | 'individual'
         """
         from matplotlib.path import Path as MplPath
         from shapely.geometry import Polygon as SP, MultiPolygon as MP
 
-        SUB = 5                               # sub-samples per cell per axis
+        SUB = max(5, int(np.ceil(self.MIN_DISPLAY_PIXELS / max(self.nx, self.ny))))
         xmin, ymin, xmax, ymax = self.bounds
         nx_s, ny_s = self.nx * SUB, self.ny * SUB
         sx = (xmax - xmin) / nx_s
@@ -454,7 +466,8 @@ class TraceGridMapper:
         ys = ymin + (np.arange(ny_s) + 0.5) * sy
 
         if mode == "even-odd":
-            grid = np.zeros((ny_s, nx_s), dtype=np.int32)
+            # uint16 is enough for any realistic overlap count and halves memory
+            grid = np.zeros((ny_s, nx_s), dtype=np.uint16)
         else:
             grid = np.zeros((ny_s, nx_s), dtype=np.bool_)
 
@@ -488,12 +501,17 @@ class TraceGridMapper:
                 if c0 >= c1 or r0 >= r1:
                     continue
 
-                gx, gy = np.meshgrid(xs[c0:c1], ys[r0:r1])
-                pts = np.column_stack([gx.ravel(), gy.ravel()])
+                # Build the sub-pixel grid lazily; use broadcasting-style
+                # concatenation to avoid the full np.meshgrid copy.
+                sub_x = xs[c0:c1]
+                sub_y = ys[r0:r1]
+                pts = np.empty((sub_y.size * sub_x.size, 2), dtype=np.float64)
+                pts[:, 0] = np.repeat(sub_x[np.newaxis, :], sub_y.size, axis=0).ravel()
+                pts[:, 1] = np.repeat(sub_y[:, np.newaxis], sub_x.size, axis=1).ravel()
 
-                inside = MplPath(np.array(sp.exterior.coords)).contains_points(pts)
+                inside = MplPath(np.asarray(sp.exterior.coords)).contains_points(pts)
                 for ring in sp.interiors:
-                    inside &= ~MplPath(np.array(ring.coords)).contains_points(pts)
+                    inside &= ~MplPath(np.asarray(ring.coords)).contains_points(pts)
 
                 mask = inside.reshape(r1 - r0, c1 - c0)
                 if mode == "even-odd":
@@ -501,14 +519,20 @@ class TraceGridMapper:
                 else:
                     grid[r0:r1, c0:c1] |= mask
 
-        # Collapse sub-pixels → grid cells
+        # Apply the custom fill rule once, at raster level:
+        #   even-odd  → 1=fill, 2=empty, 3+ always fill
+        #   other     → any coverage = fill
         if mode == "even-odd":
-            # Custom rule: 1=filled, 2=empty, 3+=always filled
-            sampled = ((grid > 0) & (grid != 2)).astype(np.float64)
+            bitmap = (grid > 0) & (grid != 2)
         else:
-            sampled = grid.astype(np.float64)
+            bitmap = grid  # already bool
 
-        self.fractions = sampled.reshape(
+        # Cache for reuse by plot_comparison's left panel.
+        self._raster_bitmap = bitmap
+        self._raster_sub = SUB
+
+        # Per-cell density = block-average of the boolean bitmap.
+        self.fractions = bitmap.astype(np.float64).reshape(
             self.ny, SUB, self.nx, SUB
         ).mean(axis=(1, 3))
 
@@ -690,166 +714,41 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
     return ax
 
 
-def _dc_xor(polys):
-    """Divide-and-conquer symmetric_difference for a small cluster."""
-    from shapely.geometry import Polygon as SP, MultiPolygon as MP, GeometryCollection
-    from shapely.ops import unary_union
-
-    n = len(polys)
-    if n == 0:
-        return SP()
-    if n == 1:
-        return polys[0]
-    mid = n // 2
-    left = _dc_xor(polys[:mid])
-    right = _dc_xor(polys[mid:])
-    result = left.symmetric_difference(right)
-    if isinstance(result, GeometryCollection) and not isinstance(result, (SP, MP)):
-        parts = [g for g in result.geoms if isinstance(g, SP)]
-        return unary_union(parts) if parts else SP()
-    return result
-
-
-def _even_odd_union(polys):
-    """Even-odd fill using spatial clustering for efficiency.
-
-    Only applies symmetric_difference (XOR) within clusters of
-    overlapping polygons.  Non-overlapping polygons pass through
-    unchanged, so cost is proportional to the amount of actual
-    overlap — not the total polygon count.
-    """
-    from shapely.geometry import Polygon as SP, MultiPolygon as MP
-    from shapely.ops import unary_union
-    from shapely import STRtree
-    from collections import defaultdict
-
-    n = len(polys)
-    if n == 0:
-        return SP()
-    if n == 1:
-        return polys[0]
-
-    # --- 1. Spatial index: find actually-intersecting pairs ---
-    tree = STRtree(polys)
-    parent = list(range(n))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a, b):
-        a, b = find(a), find(b)
-        if a != b:
-            parent[a] = b
-
-    for i in range(n):
-        hits = tree.query(polys[i])
-        for j in hits:
-            if j > i and polys[i].intersects(polys[j]):
-                union(i, j)
-
-    # --- 2. Group into connected components ---
-    groups = defaultdict(list)
-    for i in range(n):
-        groups[find(i)].append(i)
-
-    # --- 3. XOR within overlapping clusters, with custom 3+ rule ---
-    results = []
-    for indices in groups.values():
-        if len(indices) == 1:
-            results.append(polys[indices[0]])
-        elif len(indices) == 2:
-            # 2 polygons: standard XOR is correct (1=fill, 2=empty)
-            grp = [polys[i] for i in indices]
-            xor = grp[0].symmetric_difference(grp[1])
-            if not xor.is_empty:
-                results.append(xor)
-        else:
-            # 3+ polygons in cluster: XOR then restore 4+ overlap holes
-            grp = [polys[i] for i in indices]
-            xor = _dc_xor(grp)
-            grp_union = unary_union(grp)
-            # Holes from even-overlap (count 2, 4, 6…)
-            even_holes = grp_union.difference(xor)
-            if even_holes.is_empty:
-                if not xor.is_empty:
-                    results.append(xor)
-            else:
-                # Add back holes where overlap >= 4 (should be filled)
-                if isinstance(even_holes, MP):
-                    parts = list(even_holes.geoms)
-                elif isinstance(even_holes, SP) and not even_holes.is_empty:
-                    parts = [even_holes]
-                else:
-                    parts = []
-                add_back = []
-                for hole in parts:
-                    if hole.is_empty or hole.area <= 0:
-                        continue
-                    pt = hole.representative_point()
-                    cnt = sum(1 for p in grp if p.contains(pt))
-                    if cnt >= 4:
-                        add_back.append(hole)
-                final = unary_union([xor] + add_back) if add_back else xor
-                if not final.is_empty:
-                    results.append(final)
-
-    if not results:
-        return SP()
-    return unary_union(results)
-
-
 def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
-    """Side-by-side: even-odd copper with grid overlay vs fraction heatmap.
+    """Side-by-side: custom-XOR copper bitmap with grid overlay vs fraction heatmap.
 
-    Left panel : copper polygons refined by even-odd fill (gold) with grid
-    Right panel: copper fraction heatmap (grid mapping result)
+    Left panel : copper region after the custom XOR rule (1=fill, 2=empty,
+                 3+=always fill) rendered straight from the cached sub-pixel
+                 bitmap that ``mapper.compute`` already produced — no
+                 polygon-level symmetric_difference pass.
+    Right panel: per-cell copper fraction (density) heat map.
     """
-    from shapely.geometry import MultiPolygon, Polygon as ShapelyPolygon
+    import matplotlib.colors as mcolors
 
     if mapper.fractions is None:
         mapper.compute()
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
 
-    # --- Left panel: even-odd refined polygons + grid overlay ---
-    if layer.copper is not None:
-        geom = layer.copper
-        if isinstance(geom, MultiPolygon):
-            polys = list(geom.geoms)
-        else:
-            polys = [geom]
-    else:
-        polys = layer.copper_polys or []
+    info = mapper.grid_info
+    extent = [info['xmin'], info['xmax'], info['ymin'], info['ymax']]
 
-    if mapper.even_odd and polys:
-        refined = _even_odd_union(polys)
+    # --- Left panel: render the cached XOR bitmap as an image ---
+    bitmap = mapper._raster_bitmap
+    if bitmap is not None:
+        r, g, b, _ = mcolors.to_rgba('gold')
+        rgba = np.empty((*bitmap.shape, 4), dtype=np.float32)
+        rgba[..., 0] = np.where(bitmap, r, 1.0)
+        rgba[..., 1] = np.where(bitmap, g, 1.0)
+        rgba[..., 2] = np.where(bitmap, b, 1.0)
+        rgba[..., 3] = 1.0
+        ax1.imshow(rgba, origin='lower', extent=extent, aspect='equal',
+                   interpolation='nearest')
     else:
-        refined = polys
-
-    # Normalise to list of Polygons
-    if isinstance(refined, MultiPolygon):
-        draw_polys = list(refined.geoms)
-    elif isinstance(refined, ShapelyPolygon):
-        draw_polys = [refined]
-    elif isinstance(refined, list):
-        draw_polys = refined
-    else:
-        draw_polys = []
-
-    for poly in draw_polys:
-        if not isinstance(poly, ShapelyPolygon) or poly.is_empty:
-            continue
-        x, y = poly.exterior.xy
-        ax1.fill(x, y, fc='gold', ec='none', alpha=0.9)
-        for interior in poly.interiors:
-            ix, iy = interior.xy
-            ax1.fill(ix, iy, fc='white', ec='none', alpha=1.0)
+        # Fallback (shouldn't happen once compute() ran)
+        ax1.set_facecolor('white')
 
     # Grid overlay
-    info = mapper.grid_info
     for i in range(mapper.nx + 1):
         x = info['xmin'] + i * info['dx']
         ax1.axvline(x, color='gray', lw=0.3, alpha=0.5)
@@ -860,7 +759,8 @@ def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
     ax1.set_xlim(info['xmin'], info['xmax'])
     ax1.set_ylim(info['ymin'], info['ymax'])
     ax1.set_aspect('equal')
-    ax1.set_title(f"Copper: {layer.name}  ({mapper.nx}×{mapper.ny} grid)")
+    mode_str = "custom XOR" if mapper.even_odd else "coverage"
+    ax1.set_title(f"Copper ({mode_str}): {layer.name}  ({mapper.nx}×{mapper.ny} grid)")
     ax1.set_xlabel('X')
     ax1.set_ylabel('Y')
 
@@ -1289,40 +1189,36 @@ def gui_main():
                 sys.stdout = old_stdout
 
         def _finish_plots(results, files, out):
-            """Generate plots & savefig on the main thread (matplotlib requirement)."""
+            """Generate plots & savefig on the main thread (matplotlib requirement).
+
+            ``plot_comparison`` now only needs ``layer.name`` and
+            ``layer.filepath`` for the title/output path, so skip the
+            expensive reparse of every Gerber file that was previously
+            required for polygon-level re-rendering.
+            """
             try:
-                if do_plot or do_show:
-                    # Reload layers minimally for plotting (need polygon data)
-                    layers_by_name = {}
-                    for fp in files:
-                        try:
-                            layer = GerberLayer(filepath=fp, no_merge=True)
-                            layer.load()
-                            layer.to_polygons()
-                            if excl_n > 0 and layer.copper_polys:
-                                layer._copper_polys = _exclude_largest_polygons(
-                                    layer.copper_polys, excl_n)
-                            layers_by_name[layer.name] = layer
-                        except Exception:
-                            pass
+                if not (do_plot or do_show):
+                    return
 
-                    for name, mapper in results.items():
-                        layer = layers_by_name.get(name)
-                        if layer is None:
-                            continue
-                        stem = Path(layer.filepath).stem
-                        out_base = Path(out) if out else Path(layer.filepath).parent
+                fp_by_name = {Path(fp).stem: fp for fp in files}
 
-                        if do_plot:
-                            fig = plot_comparison(layer, mapper)
-                            png_path = out_base / f"{stem}.png"
-                            fig.savefig(str(png_path), dpi=150, bbox_inches='tight')
-                            if not do_show:
-                                plt.close(fig)
-                            log(f"Plot saved: {png_path}\n")
+                for name, mapper in results.items():
+                    fp = fp_by_name.get(name)
+                    if fp is None:
+                        continue
+                    stub = type('LayerStub', (), {'name': name, 'filepath': fp})()
+                    out_base = Path(out) if out else Path(fp).parent
 
-                    if do_show:
-                        plt.show()
+                    if do_plot:
+                        fig = plot_comparison(stub, mapper)
+                        png_path = out_base / f"{name}.png"
+                        fig.savefig(str(png_path), dpi=150, bbox_inches='tight')
+                        if not do_show:
+                            plt.close(fig)
+                        log(f"Plot saved: {png_path}\n")
+
+                if do_show:
+                    plt.show()
             except Exception as e:
                 log(f"\nPlot ERROR: {e}\n")
             finally:

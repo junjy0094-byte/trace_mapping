@@ -413,6 +413,7 @@ class TraceGridMapper:
     ny: int = 20
     bounds: Optional[Tuple[float, float, float, float]] = None
     even_odd: bool = False
+    min_display_pixels: int = 600
     fractions: np.ndarray = field(default=None, repr=False)
     _raster_bitmap: np.ndarray = field(default=None, repr=False)
     _raster_sub: int = field(default=0, repr=False)
@@ -432,8 +433,6 @@ class TraceGridMapper:
             else:
                 raise ValueError("Either copper or copper_polys must be provided")
 
-    MIN_DISPLAY_PIXELS = 600  # min raster resolution per axis (for left-plot)
-
     def _compute_raster(self, mode):
         """Fast grid computation using point-sampling rasterisation.
 
@@ -446,16 +445,17 @@ class TraceGridMapper:
           bitmap) used by the right-panel heat map.
 
         Sub-pixel count (``SUB``) is chosen so the resulting bitmap has at
-        least ``MIN_DISPLAY_PIXELS`` per axis, giving a sharp left-panel
+        least ``self.min_display_pixels`` per axis, giving a sharp left-panel
         display without a separate render pass.  A floor of 5 keeps the
-        density estimate accurate even for very coarse grids.
+        density estimate accurate even for very coarse grids.  Increase
+        ``min_display_pixels`` for sharper detail (cost grows ~quadratically).
 
         mode: 'even-odd' | 'merged' | 'individual'
         """
         from matplotlib.path import Path as MplPath
         from shapely.geometry import Polygon as SP, MultiPolygon as MP
 
-        SUB = max(5, int(np.ceil(self.MIN_DISPLAY_PIXELS / max(self.nx, self.ny))))
+        SUB = max(5, int(np.ceil(self.min_display_pixels / max(self.nx, self.ny))))
         xmin, ymin, xmax, ymax = self.bounds
         nx_s, ny_s = self.nx * SUB, self.ny * SUB
         sx = (xmax - xmin) / nx_s
@@ -833,7 +833,8 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                    bounds=None, shared_bounds=True,
                    export_csv=True, plot=True, show=False, outdir=None,
                    merge_tolerance=0.0, no_merge=False, interactive=False,
-                   even_odd=True, exclude_largest=0):
+                   even_odd=True, exclude_largest=0,
+                   min_display_pixels=600):
     """
     Process multiple Gerber layer files.
 
@@ -910,16 +911,19 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                 copper_polys=layer.copper_polys,
                 nx=nx, ny=ny, bounds=b,
                 even_odd=True,
+                min_display_pixels=min_display_pixels,
             )
         elif layer.no_merge or layer.copper is None:
             mapper = TraceGridMapper(
                 copper_polys=layer.copper_polys,
                 nx=nx, ny=ny, bounds=b,
+                min_display_pixels=min_display_pixels,
             )
         else:
             mapper = TraceGridMapper(
                 copper=layer.copper,
                 nx=nx, ny=ny, bounds=b,
+                min_display_pixels=min_display_pixels,
             )
 
         mapper.compute()
@@ -1039,6 +1043,13 @@ def gui_main():
     tol_var = tk.StringVar(value="0.0")
     ttk.Entry(param_frame, textvariable=tol_var, width=10).grid(row=0, column=5, padx=4)
 
+    ttk.Label(param_frame, text="Display Pixels:").grid(
+        row=1, column=0, padx=4, pady=2, sticky='e')
+    disp_var = tk.StringVar(value="600")
+    ttk.Entry(param_frame, textvariable=disp_var, width=8).grid(row=1, column=1, padx=4)
+    ttk.Label(param_frame, text="(left-panel raster, larger=sharper/slower)").grid(
+        row=1, column=2, columnspan=4, padx=4, pady=2, sticky='w')
+
     # ---- Output directory ----
     out_frame = ttk.LabelFrame(root, text="Output Directory (blank = same as input)")
     out_frame.pack(fill='x', padx=8, pady=4)
@@ -1128,6 +1139,11 @@ def gui_main():
         except ValueError:
             messagebox.showerror("Invalid", "Merge tolerance must be a number.")
             return
+        try:
+            disp_pix = max(50, int(disp_var.get()))
+        except ValueError:
+            messagebox.showerror("Invalid", "Display pixels must be an integer.")
+            return
 
         outdir = outdir_var.get().strip() or None
         excl_n = 0
@@ -1165,6 +1181,7 @@ def gui_main():
                     interactive=interactive_var.get(),
                     even_odd=even_odd_var.get(),
                     exclude_largest=excl_n,
+                    min_display_pixels=disp_pix,
                 )
 
                 # Summary
@@ -1298,6 +1315,11 @@ def main():
         '--exclude-largest', type=int, default=0, metavar='N',
         help='Exclude the N largest polygons (by area) per layer. '
              'Useful for removing outer board-outline polygons. (default: 0)')
+    parser.add_argument(
+        '--display-pixels', type=int, default=600, metavar='N',
+        help='Minimum sub-pixel raster size per axis for the left-panel '
+             'display (default: 600). Larger = sharper detail, slower '
+             '(cost ~quadratic). e.g. 1200, 2000, 4000.')
 
     args = parser.parse_args()
 
@@ -1336,6 +1358,7 @@ def main():
         interactive=args.interactive,
         even_odd=use_even_odd,
         exclude_largest=args.exclude_largest,
+        min_display_pixels=args.display_pixels,
     )
 
     if args.show:

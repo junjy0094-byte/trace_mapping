@@ -1,0 +1,271 @@
+"""TraceGridMapper: sub-pixel rasterisation and per-cell copper fraction.
+
+The mapper builds one boolean sub-pixel bitmap and derives two outputs:
+  _raster_bitmap  – reused by plot.py for the left display panel
+  fractions       – per-cell copper density (block-averaged from bitmap)
+
+Cache integration: process.py saves/loads the bitmap so that the full
+parse+rasterise phase is skipped on repeated runs with the same parameters.
+"""
+
+import numpy as np
+import time
+from dataclasses import dataclass, field
+from typing import Optional, Tuple
+
+
+@dataclass
+class TraceGridMapper:
+    """
+    Divides a bounding region into an NxM grid and computes
+    copper area fraction per cell.
+
+    Supports two modes:
+    - Merged mode: copper is a single (Multi)Polygon from unary_union
+    - Individual mode: copper_polys is a list of separate polygons
+      (no_merge mode). Uses STRtree spatial index for performance.
+
+    Attributes:
+        copper: Shapely geometry of merged copper regions (or None)
+        copper_polys: List of individual copper polygons (or None)
+        nx, ny: Grid divisions in X and Y
+        bounds: (xmin, ymin, xmax, ymax) override, or auto from copper
+        even_odd: If True, apply even-odd fill rule per cell (odd=filled,
+                  even=empty). Requires copper_polys (individual mode).
+        fractions: 2D numpy array [ny, nx] of copper fractions (0~1)
+    """
+    copper: object = None
+    copper_polys: list = None
+    nx: int = 20
+    ny: int = 20
+    bounds: Optional[Tuple[float, float, float, float]] = None
+    even_odd: bool = False
+    min_display_pixels: int = 600
+    fractions: np.ndarray = field(default=None, repr=False)
+    _raster_bitmap: np.ndarray = field(default=None, repr=False)
+    _raster_sub: int = field(default=0, repr=False)
+
+    def __post_init__(self):
+        if self.bounds is None:
+            if self.copper is not None:
+                self.bounds = self.copper.bounds
+            elif self.copper_polys:
+                all_b = [g.bounds for g in self.copper_polys]
+                self.bounds = (
+                    min(b[0] for b in all_b),
+                    min(b[1] for b in all_b),
+                    max(b[2] for b in all_b),
+                    max(b[3] for b in all_b),
+                )
+            else:
+                raise ValueError("Either copper or copper_polys must be provided")
+
+    def _fractions_from_bitmap(self):
+        """Block-average self._raster_bitmap into the ny×nx density grid.
+
+        Uses a summed-area-table so arbitrary (bitmap-H, bitmap-W) shapes
+        work even when not evenly divisible by (ny, nx).
+        """
+        bitmap = self._raster_bitmap
+        if bitmap is None:
+            raise RuntimeError("no raster bitmap available")
+        H, W = bitmap.shape
+
+        # Auto-detect SUB when bitmap came from cache without a recorded SUB.
+        if self._raster_sub <= 0 and self.nx > 0 and self.ny > 0:
+            if H % self.ny == 0 and W % self.nx == 0 \
+                    and (H // self.ny) == (W // self.nx):
+                self._raster_sub = H // self.ny
+
+        # Fast path: bitmap is an exact (ny*SUB, nx*SUB) tiling.
+        if self._raster_sub > 0 and H == self.ny * self._raster_sub \
+                and W == self.nx * self._raster_sub:
+            S = self._raster_sub
+            self.fractions = bitmap.astype(np.float64).reshape(
+                self.ny, S, self.nx, S
+            ).mean(axis=(1, 3))
+            return
+
+        # General path: summed-area-table on integer image, fully vectorised.
+        ii = np.zeros((H + 1, W + 1), dtype=np.int64)
+        ii[1:, 1:] = bitmap.astype(np.int64).cumsum(axis=0).cumsum(axis=1)
+
+        xs_i = np.linspace(0, W, self.nx + 1).round().astype(np.int64)
+        ys_i = np.linspace(0, H, self.ny + 1).round().astype(np.int64)
+        x0s, x1s = xs_i[:-1], xs_i[1:]
+        y0s, y1s = ys_i[:-1], ys_i[1:]
+
+        sums = (ii[np.ix_(y1s, x1s)] - ii[np.ix_(y0s, x1s)]
+                - ii[np.ix_(y1s, x0s)] + ii[np.ix_(y0s, x0s)])
+        areas = (y1s - y0s)[:, None] * (x1s - x0s)[None, :]
+        fractions = np.zeros_like(sums, dtype=np.float64)
+        np.divide(sums, areas, out=fractions, where=areas > 0)
+        self.fractions = fractions
+
+    def _compute_raster(self, mode):
+        """Fast grid computation using point-sampling rasterisation.
+
+        Sub-pixel count (SUB) is chosen so the bitmap has at least
+        self.min_display_pixels per axis; floor of 5 keeps density
+        estimates accurate on very coarse grids.
+
+        mode: 'even-odd' | 'merged' | 'individual'
+        """
+        from matplotlib.path import Path as MplPath
+        from shapely.geometry import Polygon as SP, MultiPolygon as MP
+
+        SUB = max(5, int(np.ceil(self.min_display_pixels / max(self.nx, self.ny))))
+        xmin, ymin, xmax, ymax = self.bounds
+        nx_s, ny_s = self.nx * SUB, self.ny * SUB
+        sx = (xmax - xmin) / nx_s
+        sy = (ymax - ymin) / ny_s
+
+        xs = xmin + (np.arange(nx_s) + 0.5) * sx
+        ys = ymin + (np.arange(ny_s) + 0.5) * sy
+
+        if mode == "even-odd":
+            grid = np.zeros((ny_s, nx_s), dtype=np.uint16)
+        else:
+            grid = np.zeros((ny_s, nx_s), dtype=np.bool_)
+
+        src = [self.copper] if mode == "merged" else self.copper_polys
+        n_src = len(src)
+
+        for k, geom in enumerate(src):
+            if n_src > 200 and (k + 1) % 500 == 0:
+                print(f"    rasterising {k+1}/{n_src} polygons ...", flush=True)
+
+            if isinstance(geom, MP):
+                simple = list(geom.geoms)
+            elif isinstance(geom, SP):
+                simple = [geom]
+            else:
+                continue
+
+            for sp in simple:
+                if sp.is_empty:
+                    continue
+                pxmin, pymin, pxmax, pymax = sp.bounds
+                c0 = max(0, int((pxmin - xmin) / sx))
+                c1 = min(nx_s, int(np.ceil((pxmax - xmin) / sx)))
+                r0 = max(0, int((pymin - ymin) / sy))
+                r1 = min(ny_s, int(np.ceil((pymax - ymin) / sy)))
+                if c0 >= c1 or r0 >= r1:
+                    continue
+
+                sub_x = xs[c0:c1]
+                sub_y = ys[r0:r1]
+                pts = np.empty((sub_y.size * sub_x.size, 2), dtype=np.float64)
+                pts[:, 0] = np.repeat(sub_x[np.newaxis, :], sub_y.size, axis=0).ravel()
+                pts[:, 1] = np.repeat(sub_y[:, np.newaxis], sub_x.size, axis=1).ravel()
+
+                inside = MplPath(np.asarray(sp.exterior.coords)).contains_points(pts)
+                for ring in sp.interiors:
+                    inside &= ~MplPath(np.asarray(ring.coords)).contains_points(pts)
+
+                mask = inside.reshape(r1 - r0, c1 - c0)
+                if mode == "even-odd":
+                    grid[r0:r1, c0:c1] += mask
+                else:
+                    grid[r0:r1, c0:c1] |= mask
+
+        # Apply fill rule: even-odd → 1=fill, 2=empty, 3+=always fill
+        if mode == "even-odd":
+            bitmap = (grid > 0) & (grid != 2)
+        else:
+            bitmap = grid
+
+        self._raster_bitmap = bitmap
+        self._raster_sub = SUB
+
+        self.fractions = bitmap.astype(np.float64).reshape(
+            self.ny, SUB, self.nx, SUB
+        ).mean(axis=(1, 3))
+
+    def compute(self):
+        """Compute copper fraction for each grid cell."""
+        xmin, ymin, xmax, ymax = self.bounds
+        dx = (xmax - xmin) / self.nx
+        dy = (ymax - ymin) / self.ny
+        cell_area = dx * dy
+
+        if cell_area <= 0:
+            raise ValueError(f"Invalid grid: bounds={self.bounds}, nx={self.nx}, ny={self.ny}")
+
+        total = self.nx * self.ny
+
+        # Fast path: cached raster already injected; derive fractions only.
+        if self._raster_bitmap is not None and not (self.copper_polys or self.copper):
+            t0 = time.time()
+            self._fractions_from_bitmap()
+            elapsed = time.time() - t0
+            nonzero = np.count_nonzero(self.fractions)
+            print(f"Reused cached raster {self._raster_bitmap.shape} → "
+                  f"{self.nx}x{self.ny} cells in {elapsed:.2f}s  |  "
+                  f"non-zero: {nonzero}/{total}  |  "
+                  f"avg fraction: {self.fractions.mean():.4f}")
+            return self.fractions
+
+        if self.even_odd:
+            if not self.copper_polys:
+                raise ValueError("even_odd mode requires copper_polys (individual polygons)")
+            mode = "even-odd"
+        elif self.copper is not None:
+            mode = "merged"
+        elif self.copper_polys:
+            mode = "individual"
+        else:
+            raise ValueError("No copper geometry provided")
+
+        print(f"Computing {self.nx}x{self.ny} = {total} cells (mode={mode}) ... ",
+              flush=True)
+        t0 = time.time()
+
+        self._compute_raster(mode)
+
+        elapsed = time.time() - t0
+        nonzero = np.count_nonzero(self.fractions)
+        print(f"  Done in {elapsed:.1f}s  |  "
+              f"non-zero cells: {nonzero}/{total}  |  "
+              f"avg fraction: {self.fractions.mean():.4f}")
+        return self.fractions
+
+    @property
+    def grid_info(self):
+        """Return grid metadata dict."""
+        xmin, ymin, xmax, ymax = self.bounds
+        return {
+            'nx': self.nx, 'ny': self.ny,
+            'xmin': xmin, 'ymin': ymin, 'xmax': xmax, 'ymax': ymax,
+            'dx': (xmax - xmin) / self.nx,
+            'dy': (ymax - ymin) / self.ny,
+        }
+
+    def to_csv(self, filepath: str):
+        """Export fractions to CSV (row=Y index, col=X index)."""
+        if self.fractions is None:
+            self.compute()
+        header = (f"# Trace Mapping Grid: {self.nx}x{self.ny}\n"
+                  f"# Bounds: {self.bounds}\n"
+                  f"# Row=Y(bot->top), Col=X(left->right), Value=copper fraction")
+        np.savetxt(filepath, self.fractions, delimiter=',', fmt='%.6f',
+                   header=header)
+        print(f"Saved: {filepath}")
+
+    def to_dict_array(self):
+        """Return list of dicts [{ix, iy, cx, cy, fraction}, ...] for non-zero cells."""
+        if self.fractions is None:
+            self.compute()
+        info = self.grid_info
+        records = []
+        for j in range(self.ny):
+            for i in range(self.nx):
+                f = self.fractions[j, i]
+                if f > 0:
+                    records.append({
+                        'ix': i, 'iy': j,
+                        'cx': info['xmin'] + (i + 0.5) * info['dx'],
+                        'cy': info['ymin'] + (j + 0.5) * info['dy'],
+                        'fraction': f,
+                    })
+        return records

@@ -894,47 +894,68 @@ def compute_shared_bounds(layers: List[GerberLayer]):
 #  table.  Cache hits skip the entire Gerber parse + rasterisation phase.
 # ---------------------------------------------------------------------------
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 CACHE_DIRNAME = ".trace_cache"
 
 
-def _raster_cache_key(filepath: str, params: dict) -> Tuple[str, dict]:
-    """Return (hash, canonical-params). Hash covers file identity + every
-    parameter that affects the rasterised bitmap (but NOT nx/ny)."""
-    import hashlib, json, os
+def _file_identity_hash(filepath: str) -> str:
+    """8-char hex derived from file size + partial content (no path, no mtime).
+    Stable across directory moves and program restarts."""
+    import hashlib
+    CHUNK = 32 * 1024
     st = os.stat(filepath)
-    canon = {
-        'file': os.path.abspath(filepath),
-        'mtime_ns': st.st_mtime_ns,
-        'size': st.st_size,
-        'v': CACHE_VERSION,
-        **params,
-    }
+    h = hashlib.sha256()
+    h.update(str(st.st_size).encode())
+    with open(filepath, 'rb') as f:
+        h.update(f.read(CHUNK))
+        if st.st_size > CHUNK * 2:
+            f.seek(-CHUNK, 2)
+            h.update(f.read(CHUNK))
+    return h.hexdigest()[:8]
+
+
+def _raster_params_hash(params: dict) -> str:
+    """6-char hash covering only processing parameters (excludes file identity)."""
+    import hashlib, json
+    canon = {'v': CACHE_VERSION, **params}
     blob = json.dumps(canon, sort_keys=True, default=str).encode()
-    return hashlib.sha1(blob).hexdigest()[:12], canon
+    return hashlib.sha1(blob).hexdigest()[:6]
 
 
-def _raster_cache_path(filepath: str, key_hash: str, outdir=None) -> Path:
+def _raster_cache_path(filepath: str, file_hash: str, params_hash: str,
+                       min_display_pixels: int = 0, is_meta: bool = False) -> Path:
+    """Cache is always stored next to the art file so it persists across
+    restarts and regardless of which --outdir is used for CSV/PNG output.
+
+    Naming:
+      raster: <stem>_mpx<N>_<file_hash8>_<params_hash6>.npz
+      meta:   <stem>_meta_<file_hash8>_<params_hash6>.npz
+    """
     stem = Path(filepath).stem
-    root = Path(outdir) if outdir else Path(filepath).parent
-    return root / CACHE_DIRNAME / f"{stem}_{key_hash}.npz"
+    root = Path(filepath).parent
+    if is_meta:
+        name = f"{stem}_meta_{file_hash}_{params_hash}.npz"
+    else:
+        mpx = f"_mpx{min_display_pixels}" if min_display_pixels > 0 else ""
+        name = f"{stem}{mpx}_{file_hash}_{params_hash}.npz"
+    return root / CACHE_DIRNAME / name
 
 
 def _save_raster_cache(path: Path, bitmap: np.ndarray,
-                       bounds: Tuple[float, float, float, float]) -> None:
+                       bounds: Tuple[float, float, float, float],
+                       sub: int = 0) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    # uint8 halves disk / mem vs bool (which numpy stores as 1 byte anyway,
-    # but uint8 is unambiguous across numpy versions).
     np.savez_compressed(
         path,
         version=np.int32(CACHE_VERSION),
         bitmap=bitmap.astype(np.uint8),
         bounds=np.array(bounds, dtype=np.float64),
+        sub=np.int32(sub),
     )
 
 
 def _load_raster_cache(path: Path):
-    """Return (bitmap_bool, bounds_tuple) or None if missing/corrupt."""
+    """Return (bitmap_bool, bounds_tuple, sub_int) or None if missing/corrupt."""
     if not path.exists():
         return None
     try:
@@ -943,7 +964,8 @@ def _load_raster_cache(path: Path):
                 return None
             bitmap = d['bitmap'].astype(bool)
             bounds = tuple(d['bounds'].tolist())
-            return bitmap, bounds
+            sub = int(d['sub']) if 'sub' in d else 0
+            return bitmap, bounds, sub
     except Exception as e:
         print(f"  Cache read failed ({path.name}): {e}")
         return None
@@ -1017,17 +1039,21 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
             return None
 
     # --- Step 1: Determine each file's own bounds ---------------------------
-    # Try the meta cache first (params + file mtime/size).  On hit, skip the
-    # Gerber parse entirely for now and defer to Step 3 if we end up needing
-    # polygons (raster cache miss).
+    # Try the meta cache first (keyed on file content hash + poly params).
+    # On hit, skip the Gerber parse entirely; defer to Step 3 on raster miss.
     parsed: dict = {}            # fp -> GerberLayer (if already parsed)
     own_bounds: dict = {}        # fp -> (xmin, ymin, xmax, ymax)
 
+    file_hashes: dict = {}   # fp -> _file_identity_hash(fp), computed once per file
+
     for fp in filepaths:
         ob = None
+        meta_path = None
         if cache_enabled:
-            meta_hash, _ = _raster_cache_key(fp, {**poly_params, 'kind': 'meta'})
-            meta_path = _raster_cache_path(fp, 'meta_' + meta_hash, outdir)
+            f_hash = _file_identity_hash(fp)
+            file_hashes[fp] = f_hash
+            meta_p_hash = _raster_params_hash({**poly_params, 'kind': 'meta'})
+            meta_path = _raster_cache_path(fp, f_hash, meta_p_hash, is_meta=True)
             if meta_path.exists():
                 try:
                     with np.load(meta_path, allow_pickle=False) as d:
@@ -1041,11 +1067,10 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                 continue
             ob = layer.bounds
             parsed[fp] = layer
-            if cache_enabled:
-                meta_hash, _ = _raster_cache_key(fp, {**poly_params, 'kind': 'meta'})
-                meta_path = _raster_cache_path(fp, 'meta_' + meta_hash, outdir)
+            if cache_enabled and meta_path is not None:
                 meta_path.parent.mkdir(parents=True, exist_ok=True)
                 np.savez_compressed(meta_path, bounds=np.array(ob, dtype=np.float64))
+                print(f"  Meta cache saved: {meta_path.name}")
         own_bounds[fp] = ob
 
     if not own_bounds:
@@ -1076,13 +1101,18 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         raster_params_fp = {**raster_params,
                             'bounds': tuple(round(v, 9) for v in eff_b)}
         bitmap = cached_bounds = None
+        cached_sub = 0
+        r_path = None
         if cache_enabled:
-            r_hash, _ = _raster_cache_key(fp, raster_params_fp)
-            r_path = _raster_cache_path(fp, r_hash, outdir)
+            f_hash = file_hashes.get(fp) or _file_identity_hash(fp)
+            r_p_hash = _raster_params_hash(raster_params_fp)
+            r_path = _raster_cache_path(fp, f_hash, r_p_hash,
+                                        min_display_pixels=min_display_pixels)
             loaded = _load_raster_cache(r_path)
             if loaded is not None:
-                bitmap, cached_bounds = loaded
-                print(f"  Raster cache hit: {name}  bitmap={bitmap.shape}")
+                bitmap, cached_bounds, cached_sub = loaded
+                print(f"  Raster cache hit: {name}  bitmap={bitmap.shape}  "
+                      f"sub={cached_sub}  [{r_path.name}]")
 
         if bitmap is None:
             # Need polygons + rasterization
@@ -1112,8 +1142,9 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                 )
             mapper.compute()
 
-            if cache_enabled:
-                _save_raster_cache(r_path, mapper._raster_bitmap, eff_b)
+            if cache_enabled and r_path is not None:
+                _save_raster_cache(r_path, mapper._raster_bitmap, eff_b,
+                                   sub=mapper._raster_sub)
                 print(f"  Raster cache saved: {r_path.name}")
         else:
             # Cache hit path: create empty mapper, inject bitmap, derive fractions.
@@ -1123,6 +1154,7 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                 min_display_pixels=min_display_pixels,
             )
             mapper._raster_bitmap = bitmap
+            mapper._raster_sub = cached_sub
             mapper.compute()
 
         stem = Path(fp).stem
@@ -1469,12 +1501,10 @@ def gui_main():
         threading.Thread(target=worker, daemon=True).start()
 
     def clear_cache():
-        """Delete every .trace_cache entry next to the listed files or in outdir."""
+        """Delete .trace_cache directories next to the listed art files.
+        Cache is always stored beside the art file, independent of outdir."""
         import shutil
         roots = set()
-        od = outdir_var.get().strip()
-        if od:
-            roots.add(Path(od))
         for p in file_listbox.get(0, tk.END):
             pp = Path(p)
             roots.add(pp if pp.is_dir() else pp.parent)
@@ -1594,9 +1624,9 @@ def main():
 
     if args.clear_cache:
         import shutil
-        roots = {Path(args.outdir)} if args.outdir else set()
-        roots.update(Path(p).parent if Path(p).is_file() else Path(p)
-                     for p in args.paths)
+        # Cache is always stored beside the art file, not in outdir.
+        roots = {Path(p).parent if Path(p).is_file() else Path(p)
+                 for p in args.paths}
         for r in roots:
             c = r / CACHE_DIRNAME
             if c.exists():

@@ -503,7 +503,8 @@ class TraceGridMapper:
 
         # Collapse sub-pixels → grid cells
         if mode == "even-odd":
-            sampled = (grid % 2 == 1).astype(np.float64)
+            # Custom rule: 1=filled, 2=empty, 3+=always filled
+            sampled = ((grid > 0) & (grid != 2)).astype(np.float64)
         else:
             sampled = grid.astype(np.float64)
 
@@ -689,15 +690,183 @@ def plot_evenodd_copper(mapper: TraceGridMapper, layer_name="", ax=None,
     return ax
 
 
-def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
-    """Side-by-side: raw copper artwork vs fraction heatmap.
+def _dc_xor(polys):
+    """Divide-and-conquer symmetric_difference for a small cluster."""
+    from shapely.geometry import Polygon as SP, MultiPolygon as MP, GeometryCollection
+    from shapely.ops import unary_union
 
-    Left panel : raw copper polygons from the art file
+    n = len(polys)
+    if n == 0:
+        return SP()
+    if n == 1:
+        return polys[0]
+    mid = n // 2
+    left = _dc_xor(polys[:mid])
+    right = _dc_xor(polys[mid:])
+    result = left.symmetric_difference(right)
+    if isinstance(result, GeometryCollection) and not isinstance(result, (SP, MP)):
+        parts = [g for g in result.geoms if isinstance(g, SP)]
+        return unary_union(parts) if parts else SP()
+    return result
+
+
+def _even_odd_union(polys):
+    """Even-odd fill using spatial clustering for efficiency.
+
+    Only applies symmetric_difference (XOR) within clusters of
+    overlapping polygons.  Non-overlapping polygons pass through
+    unchanged, so cost is proportional to the amount of actual
+    overlap — not the total polygon count.
+    """
+    from shapely.geometry import Polygon as SP, MultiPolygon as MP
+    from shapely.ops import unary_union
+    from shapely import STRtree
+    from collections import defaultdict
+
+    n = len(polys)
+    if n == 0:
+        return SP()
+    if n == 1:
+        return polys[0]
+
+    # --- 1. Spatial index: find actually-intersecting pairs ---
+    tree = STRtree(polys)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        a, b = find(a), find(b)
+        if a != b:
+            parent[a] = b
+
+    for i in range(n):
+        hits = tree.query(polys[i])
+        for j in hits:
+            if j > i and polys[i].intersects(polys[j]):
+                union(i, j)
+
+    # --- 2. Group into connected components ---
+    groups = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(i)
+
+    # --- 3. XOR within overlapping clusters, with custom 3+ rule ---
+    results = []
+    for indices in groups.values():
+        if len(indices) == 1:
+            results.append(polys[indices[0]])
+        elif len(indices) == 2:
+            # 2 polygons: standard XOR is correct (1=fill, 2=empty)
+            grp = [polys[i] for i in indices]
+            xor = grp[0].symmetric_difference(grp[1])
+            if not xor.is_empty:
+                results.append(xor)
+        else:
+            # 3+ polygons in cluster: XOR then restore 4+ overlap holes
+            grp = [polys[i] for i in indices]
+            xor = _dc_xor(grp)
+            grp_union = unary_union(grp)
+            # Holes from even-overlap (count 2, 4, 6…)
+            even_holes = grp_union.difference(xor)
+            if even_holes.is_empty:
+                if not xor.is_empty:
+                    results.append(xor)
+            else:
+                # Add back holes where overlap >= 4 (should be filled)
+                if isinstance(even_holes, MP):
+                    parts = list(even_holes.geoms)
+                elif isinstance(even_holes, SP) and not even_holes.is_empty:
+                    parts = [even_holes]
+                else:
+                    parts = []
+                add_back = []
+                for hole in parts:
+                    if hole.is_empty or hole.area <= 0:
+                        continue
+                    pt = hole.representative_point()
+                    cnt = sum(1 for p in grp if p.contains(pt))
+                    if cnt >= 4:
+                        add_back.append(hole)
+                final = unary_union([xor] + add_back) if add_back else xor
+                if not final.is_empty:
+                    results.append(final)
+
+    if not results:
+        return SP()
+    return unary_union(results)
+
+
+def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
+    """Side-by-side: even-odd copper with grid overlay vs fraction heatmap.
+
+    Left panel : copper polygons refined by even-odd fill (gold) with grid
     Right panel: copper fraction heatmap (grid mapping result)
     """
+    from shapely.geometry import MultiPolygon, Polygon as ShapelyPolygon
+
+    if mapper.fractions is None:
+        mapper.compute()
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    plot_copper(layer, ax=ax1)
+
+    # --- Left panel: even-odd refined polygons + grid overlay ---
+    if layer.copper is not None:
+        geom = layer.copper
+        if isinstance(geom, MultiPolygon):
+            polys = list(geom.geoms)
+        else:
+            polys = [geom]
+    else:
+        polys = layer.copper_polys or []
+
+    if mapper.even_odd and polys:
+        refined = _even_odd_union(polys)
+    else:
+        refined = polys
+
+    # Normalise to list of Polygons
+    if isinstance(refined, MultiPolygon):
+        draw_polys = list(refined.geoms)
+    elif isinstance(refined, ShapelyPolygon):
+        draw_polys = [refined]
+    elif isinstance(refined, list):
+        draw_polys = refined
+    else:
+        draw_polys = []
+
+    for poly in draw_polys:
+        if not isinstance(poly, ShapelyPolygon) or poly.is_empty:
+            continue
+        x, y = poly.exterior.xy
+        ax1.fill(x, y, fc='gold', ec='none', alpha=0.9)
+        for interior in poly.interiors:
+            ix, iy = interior.xy
+            ax1.fill(ix, iy, fc='white', ec='none', alpha=1.0)
+
+    # Grid overlay
+    info = mapper.grid_info
+    for i in range(mapper.nx + 1):
+        x = info['xmin'] + i * info['dx']
+        ax1.axvline(x, color='gray', lw=0.3, alpha=0.5)
+    for j in range(mapper.ny + 1):
+        y = info['ymin'] + j * info['dy']
+        ax1.axhline(y, color='gray', lw=0.3, alpha=0.5)
+
+    ax1.set_xlim(info['xmin'], info['xmax'])
+    ax1.set_ylim(info['ymin'], info['ymax'])
+    ax1.set_aspect('equal')
+    ax1.set_title(f"Copper: {layer.name}  ({mapper.nx}×{mapper.ny} grid)")
+    ax1.set_xlabel('X')
+    ax1.set_ylabel('Y')
+
+    # --- Right panel: fraction heatmap ---
     plot_fraction_map(mapper, ax=ax2, title=f"{layer.name} -- Grid Mapping")
+
     fig.tight_layout()
     return fig
 
@@ -705,6 +874,28 @@ def plot_comparison(layer: GerberLayer, mapper: TraceGridMapper):
 # ---------------------------------------------------------------------------
 #  Multi-layer batch processing
 # ---------------------------------------------------------------------------
+
+def _exclude_largest_polygons(polys, n):
+    """Remove the *n* largest polygons (by area) from the list.
+
+    Useful for discarding outer-border polygons that come from the
+    Gerber board outline.  Returns the filtered list and prints which
+    polygons were removed.
+    """
+    if n <= 0 or not polys or n >= len(polys):
+        if n >= len(polys) and polys:
+            print(f"  Warning: exclude count ({n}) >= total polygons ({len(polys)}), "
+                  "skipping exclusion.")
+        return polys
+
+    indexed = sorted(enumerate(polys), key=lambda x: x[1].area, reverse=True)
+    exclude_indices = set(idx for idx, _ in indexed[:n])
+    filtered = [p for i, p in enumerate(polys) if i not in exclude_indices]
+    print(f"  Excluded {n} largest polygon(s) by area:")
+    for idx, poly in indexed[:n]:
+        print(f"    polygon #{idx}: area = {poly.area:.6f}")
+    return filtered
+
 
 def collect_art_files(paths: List[str], extensions=('.art', '.gbr')) -> List[str]:
     """
@@ -742,7 +933,7 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                    bounds=None, shared_bounds=True,
                    export_csv=True, plot=True, show=False, outdir=None,
                    merge_tolerance=0.0, no_merge=False, interactive=False,
-                   even_odd=True):
+                   even_odd=True, exclude_largest=0):
     """
     Process multiple Gerber layer files.
 
@@ -758,6 +949,8 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         even_odd: If True (default), apply even-odd fill rule per cell.
                   Odd overlaps = filled, even overlaps = empty (hollow interior).
                   Enables hollow shapes: big rect + small rect inside = hole.
+        exclude_largest: Number of largest polygons (by area) to exclude per layer.
+                         Useful for removing outer board-outline polygons. 0 = none.
     Returns:
         dict: {layer_name: TraceGridMapper}
     """
@@ -803,6 +996,11 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
 
     for layer in layers:
         b = unified_bounds if unified_bounds else None
+
+        # Exclude largest polygons (e.g. board outline) if requested
+        if exclude_largest > 0 and layer.copper_polys:
+            layer._copper_polys = _exclude_largest_polygons(
+                layer.copper_polys, exclude_largest)
 
         # Create mapper with appropriate mode
         if even_odd:
@@ -983,6 +1181,16 @@ def gui_main():
     ttk.Checkbutton(opt_frame, text="Show plots", variable=show_var).grid(
         row=1, column=3, padx=6, pady=2, sticky='w')
 
+    exclude_var = tk.BooleanVar(value=False)
+    exclude_n_var = tk.StringVar(value="1")
+    ttk.Checkbutton(opt_frame, text="Exclude largest poly", variable=exclude_var).grid(
+        row=2, column=0, padx=6, pady=2, sticky='w')
+    ef = tk.Frame(opt_frame)
+    ef.grid(row=2, column=1, padx=6, pady=2, sticky='w')
+    ttk.Label(ef, text="Count:").pack(side='left')
+    ttk.Spinbox(ef, from_=1, to=20, textvariable=exclude_n_var,
+                width=4).pack(side='left', padx=2)
+
     # ---- Log output ----
     log_frame = ttk.LabelFrame(root, text="Log")
     log_frame.pack(fill='both', expand=True, padx=8, pady=4)
@@ -1022,6 +1230,12 @@ def gui_main():
             return
 
         outdir = outdir_var.get().strip() or None
+        excl_n = 0
+        if exclude_var.get():
+            try:
+                excl_n = int(exclude_n_var.get())
+            except ValueError:
+                excl_n = 1
         run_btn.config(state='disabled')
         do_plot = plot_var.get()
         do_show = show_var.get()
@@ -1050,6 +1264,7 @@ def gui_main():
                     no_merge=no_merge_var.get(),
                     interactive=interactive_var.get(),
                     even_odd=even_odd_var.get(),
+                    exclude_largest=excl_n,
                 )
 
                 # Summary
@@ -1084,6 +1299,9 @@ def gui_main():
                             layer = GerberLayer(filepath=fp, no_merge=True)
                             layer.load()
                             layer.to_polygons()
+                            if excl_n > 0 and layer.copper_polys:
+                                layer._copper_polys = _exclude_largest_polygons(
+                                    layer.copper_polys, excl_n)
                             layers_by_name[layer.name] = layer
                         except Exception:
                             pass
@@ -1180,6 +1398,10 @@ def main():
         help='Disable even-odd fill rule (default: even-odd is ON). '
              'With even-odd OFF, overlapping areas are summed (clamped to 1). '
              'Use this only if hollow shapes are not needed.')
+    parser.add_argument(
+        '--exclude-largest', type=int, default=0, metavar='N',
+        help='Exclude the N largest polygons (by area) per layer. '
+             'Useful for removing outer board-outline polygons. (default: 0)')
 
     args = parser.parse_args()
 
@@ -1217,6 +1439,7 @@ def main():
         no_merge=args.no_merge,
         interactive=args.interactive,
         even_odd=use_even_odd,
+        exclude_largest=args.exclude_largest,
     )
 
     if args.show:

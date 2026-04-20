@@ -101,6 +101,52 @@ def gui_main():
     ttk.Label(param_frame, text="(left-panel raster, larger=sharper/slower)").grid(
         row=1, column=2, columnspan=4, padx=4, pady=2, sticky='w')
 
+    # ---- Custom grid (non-uniform cell edges from CSV) ----
+    custom_frame = ttk.LabelFrame(
+        root, text="Custom Grid (optional: column-vector CSV of cell edges, "
+                   "overrides NX/NY when both are set)")
+    custom_frame.pack(fill='x', padx=8, pady=4)
+
+    x_csv_var = tk.StringVar(value="")
+    y_csv_var = tk.StringVar(value="")
+
+    ttk.Label(custom_frame, text="X coords CSV:").grid(
+        row=0, column=0, padx=4, pady=2, sticky='e')
+    ttk.Entry(custom_frame, textvariable=x_csv_var).grid(
+        row=0, column=1, padx=4, pady=2, sticky='ew')
+
+    def browse_x_csv():
+        p = filedialog.askopenfilename(
+            title="Select X-coordinate CSV",
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        if p:
+            x_csv_var.set(p)
+
+    ttk.Button(custom_frame, text="Browse", command=browse_x_csv).grid(
+        row=0, column=2, padx=4, pady=2)
+    ttk.Button(custom_frame, text="Clear",
+               command=lambda: x_csv_var.set("")).grid(
+        row=0, column=3, padx=4, pady=2)
+
+    ttk.Label(custom_frame, text="Y coords CSV:").grid(
+        row=1, column=0, padx=4, pady=2, sticky='e')
+    ttk.Entry(custom_frame, textvariable=y_csv_var).grid(
+        row=1, column=1, padx=4, pady=2, sticky='ew')
+
+    def browse_y_csv():
+        p = filedialog.askopenfilename(
+            title="Select Y-coordinate CSV",
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        if p:
+            y_csv_var.set(p)
+
+    ttk.Button(custom_frame, text="Browse", command=browse_y_csv).grid(
+        row=1, column=2, padx=4, pady=2)
+    ttk.Button(custom_frame, text="Clear",
+               command=lambda: y_csv_var.set("")).grid(
+        row=1, column=3, padx=4, pady=2)
+    custom_frame.grid_columnconfigure(1, weight=1)
+
     # ---- Output directory ----
     out_frame = ttk.LabelFrame(root, text="Output Directory (blank = same as input)")
     out_frame.pack(fill='x', padx=8, pady=4)
@@ -214,6 +260,15 @@ def gui_main():
             except ValueError:
                 excl_n = 1
 
+        x_csv = x_csv_var.get().strip() or None
+        y_csv = y_csv_var.get().strip() or None
+        if (x_csv is None) != (y_csv is None):
+            messagebox.showerror(
+                "Custom grid",
+                "Please provide BOTH the X and Y coordinate CSV files, "
+                "or leave both empty to use NX/NY.")
+            return
+
         # Snapshot all Tk vars on the main thread; Tk is not thread-safe.
         opts = {
             'shared_bounds': shared_bounds_var.get(),
@@ -252,6 +307,8 @@ def gui_main():
                     exclude_largest=excl_n,
                     min_display_pixels=disp_pix,
                     cache=opts['cache'],
+                    x_coords_csv=x_csv,
+                    y_coords_csv=y_csv,
                 )
 
                 log("\n=== Summary ===\n")

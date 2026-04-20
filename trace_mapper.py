@@ -47,6 +47,13 @@ def main():
                         help='Launch graphical user interface')
     parser.add_argument('--nx', type=int, default=20, help='Grid X divisions (default: 20)')
     parser.add_argument('--ny', type=int, default=20, help='Grid Y divisions (default: 20)')
+    parser.add_argument('--x-coords-csv', type=str, default=None, metavar='PATH',
+                        help='Column-vector CSV of custom X grid edges. When given '
+                             'together with --y-coords-csv, defines a non-uniform '
+                             'grid whose edges and bounds replace --nx / --ny.')
+    parser.add_argument('--y-coords-csv', type=str, default=None, metavar='PATH',
+                        help='Column-vector CSV of custom Y grid edges (pair with '
+                             '--x-coords-csv).')
     parser.add_argument('--no-shared-bounds', action='store_true',
                         help='Use per-layer bounds instead of unified bounds')
     parser.add_argument('--outdir', type=str, default=None,
@@ -147,6 +154,8 @@ def main():
         exclude_largest=args.exclude_largest,
         min_display_pixels=args.display_pixels,
         cache=not args.no_cache,
+        x_coords_csv=args.x_coords_csv,
+        y_coords_csv=args.y_coords_csv,
     )
 
     if args.show:

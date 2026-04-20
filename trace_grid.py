@@ -25,11 +25,17 @@ class TraceGridMapper:
     - Individual mode: copper_polys is a list of separate polygons
       (no_merge mode). Uses STRtree spatial index for performance.
 
+    Grid geometry can be uniform (nx/ny + bounds) or custom non-uniform
+    (x_edges / y_edges). When custom edges are given they define both the
+    cell boundaries and the overall bounds of the mapped region.
+
     Attributes:
         copper: Shapely geometry of merged copper regions (or None)
         copper_polys: List of individual copper polygons (or None)
-        nx, ny: Grid divisions in X and Y
+        nx, ny: Grid divisions in X and Y (derived from edges when custom)
         bounds: (xmin, ymin, xmax, ymax) override, or auto from copper
+        x_edges: Optional 1D array of nx+1 strictly-increasing X cell edges
+        y_edges: Optional 1D array of ny+1 strictly-increasing Y cell edges
         even_odd: If True, apply even-odd fill rule per cell (odd=filled,
                   even=empty). Requires copper_polys (individual mode).
         fractions: 2D numpy array [ny, nx] of copper fractions (0~1)
@@ -39,6 +45,8 @@ class TraceGridMapper:
     nx: int = 20
     ny: int = 20
     bounds: Optional[Tuple[float, float, float, float]] = None
+    x_edges: Optional[np.ndarray] = None
+    y_edges: Optional[np.ndarray] = None
     even_odd: bool = False
     min_display_pixels: int = 600
     fractions: np.ndarray = field(default=None, repr=False)
@@ -46,6 +54,25 @@ class TraceGridMapper:
     _raster_sub: int = field(default=0, repr=False)
 
     def __post_init__(self):
+        if self.x_edges is not None:
+            self.x_edges = np.asarray(self.x_edges, dtype=np.float64).ravel()
+            if self.x_edges.size < 2:
+                raise ValueError("x_edges must contain at least 2 values")
+            if not np.all(np.diff(self.x_edges) > 0):
+                raise ValueError("x_edges must be strictly increasing")
+            self.nx = int(self.x_edges.size - 1)
+        if self.y_edges is not None:
+            self.y_edges = np.asarray(self.y_edges, dtype=np.float64).ravel()
+            if self.y_edges.size < 2:
+                raise ValueError("y_edges must contain at least 2 values")
+            if not np.all(np.diff(self.y_edges) > 0):
+                raise ValueError("y_edges must be strictly increasing")
+            self.ny = int(self.y_edges.size - 1)
+
+        if self.x_edges is not None and self.y_edges is not None:
+            self.bounds = (float(self.x_edges[0]), float(self.y_edges[0]),
+                           float(self.x_edges[-1]), float(self.y_edges[-1]))
+
         if self.bounds is None:
             if self.copper is not None:
                 self.bounds = self.copper.bounds
@@ -60,38 +87,72 @@ class TraceGridMapper:
             else:
                 raise ValueError("Either copper or copper_polys must be provided")
 
+    @property
+    def x_edges_arr(self) -> np.ndarray:
+        """Return X-cell edge coordinates (custom if provided, else uniform)."""
+        if self.x_edges is not None:
+            return self.x_edges
+        xmin, _, xmax, _ = self.bounds
+        return np.linspace(xmin, xmax, self.nx + 1)
+
+    @property
+    def y_edges_arr(self) -> np.ndarray:
+        """Return Y-cell edge coordinates (custom if provided, else uniform)."""
+        if self.y_edges is not None:
+            return self.y_edges
+        _, ymin, _, ymax = self.bounds
+        return np.linspace(ymin, ymax, self.ny + 1)
+
+    @property
+    def custom_grid(self) -> bool:
+        return self.x_edges is not None or self.y_edges is not None
+
     def _fractions_from_bitmap(self):
         """Block-average self._raster_bitmap into the ny×nx density grid.
 
         Uses a summed-area-table so arbitrary (bitmap-H, bitmap-W) shapes
-        work even when not evenly divisible by (ny, nx).
+        and non-uniform cell edges work even when not evenly divisible.
         """
         bitmap = self._raster_bitmap
         if bitmap is None:
             raise RuntimeError("no raster bitmap available")
         H, W = bitmap.shape
+        xmin, ymin, xmax, ymax = self.bounds
 
-        # Auto-detect SUB when bitmap came from cache without a recorded SUB.
-        if self._raster_sub <= 0 and self.nx > 0 and self.ny > 0:
-            if H % self.ny == 0 and W % self.nx == 0 \
-                    and (H // self.ny) == (W // self.nx):
-                self._raster_sub = H // self.ny
+        if not self.custom_grid:
+            # Auto-detect SUB when bitmap came from cache without a recorded SUB.
+            if self._raster_sub <= 0 and self.nx > 0 and self.ny > 0:
+                if H % self.ny == 0 and W % self.nx == 0 \
+                        and (H // self.ny) == (W // self.nx):
+                    self._raster_sub = H // self.ny
 
-        # Fast path: bitmap is an exact (ny*SUB, nx*SUB) tiling.
-        if self._raster_sub > 0 and H == self.ny * self._raster_sub \
-                and W == self.nx * self._raster_sub:
-            S = self._raster_sub
-            self.fractions = bitmap.astype(np.float64).reshape(
-                self.ny, S, self.nx, S
-            ).mean(axis=(1, 3))
-            return
+            # Fast path: bitmap is an exact (ny*SUB, nx*SUB) tiling.
+            if self._raster_sub > 0 and H == self.ny * self._raster_sub \
+                    and W == self.nx * self._raster_sub:
+                S = self._raster_sub
+                self.fractions = bitmap.astype(np.float64).reshape(
+                    self.ny, S, self.nx, S
+                ).mean(axis=(1, 3))
+                return
 
         # General path: summed-area-table on integer image, fully vectorised.
+        # Works uniformly for both equal-division and custom-edge grids.
         ii = np.zeros((H + 1, W + 1), dtype=np.int64)
         ii[1:, 1:] = bitmap.astype(np.int64).cumsum(axis=0).cumsum(axis=1)
 
-        xs_i = np.linspace(0, W, self.nx + 1).round().astype(np.int64)
-        ys_i = np.linspace(0, H, self.ny + 1).round().astype(np.int64)
+        if self.x_edges is not None:
+            xs_i = np.clip(
+                np.round((self.x_edges - xmin) / (xmax - xmin) * W),
+                0, W).astype(np.int64)
+        else:
+            xs_i = np.linspace(0, W, self.nx + 1).round().astype(np.int64)
+        if self.y_edges is not None:
+            ys_i = np.clip(
+                np.round((self.y_edges - ymin) / (ymax - ymin) * H),
+                0, H).astype(np.int64)
+        else:
+            ys_i = np.linspace(0, H, self.ny + 1).round().astype(np.int64)
+
         x0s, x1s = xs_i[:-1], xs_i[1:]
         y0s, y1s = ys_i[:-1], ys_i[1:]
 
@@ -105,18 +166,35 @@ class TraceGridMapper:
     def _compute_raster(self, mode):
         """Fast grid computation using point-sampling rasterisation.
 
-        Sub-pixel count (SUB) is chosen so the bitmap has at least
-        self.min_display_pixels per axis; floor of 5 keeps density
-        estimates accurate on very coarse grids.
+        For uniform grids, sub-pixel count (SUB) is chosen so the bitmap
+        has at least self.min_display_pixels per axis; floor of 5 keeps
+        density estimates accurate on very coarse grids.
+
+        For custom (non-uniform) grids the bitmap is oversampled so the
+        thinnest cell still has at least 5 sub-pixels, while respecting
+        min_display_pixels as a floor on total bitmap size.
 
         mode: 'even-odd' | 'merged' | 'individual'
         """
         from matplotlib.path import Path as MplPath
         from shapely.geometry import Polygon as SP, MultiPolygon as MP
 
-        SUB = max(5, int(np.ceil(self.min_display_pixels / max(self.nx, self.ny))))
         xmin, ymin, xmax, ymax = self.bounds
-        nx_s, ny_s = self.nx * SUB, self.ny * SUB
+        x_range = xmax - xmin
+        y_range = ymax - ymin
+
+        if self.custom_grid:
+            # Scale raster so every cell - even the smallest - gets >=5 px.
+            dx_cells = np.diff(self.x_edges_arr)
+            dy_cells = np.diff(self.y_edges_arr)
+            nx_s = max(self.min_display_pixels, self.nx * 5,
+                       int(np.ceil(5.0 * x_range / float(dx_cells.min()))))
+            ny_s = max(self.min_display_pixels, self.ny * 5,
+                       int(np.ceil(5.0 * y_range / float(dy_cells.min()))))
+            SUB = 0  # non-uniform, no single per-cell sub-pixel count
+        else:
+            SUB = max(5, int(np.ceil(self.min_display_pixels / max(self.nx, self.ny))))
+            nx_s, ny_s = self.nx * SUB, self.ny * SUB
         sx = (xmax - xmin) / nx_s
         sy = (ymax - ymin) / ny_s
 
@@ -178,19 +256,22 @@ class TraceGridMapper:
         self._raster_bitmap = bitmap
         self._raster_sub = SUB
 
-        self.fractions = bitmap.astype(np.float64).reshape(
-            self.ny, SUB, self.nx, SUB
-        ).mean(axis=(1, 3))
+        if self.custom_grid:
+            # Non-uniform: fall back to the shared SAT averager.
+            self._fractions_from_bitmap()
+        else:
+            self.fractions = bitmap.astype(np.float64).reshape(
+                self.ny, SUB, self.nx, SUB
+            ).mean(axis=(1, 3))
 
     def compute(self):
         """Compute copper fraction for each grid cell."""
-        xmin, ymin, xmax, ymax = self.bounds
-        dx = (xmax - xmin) / self.nx
-        dy = (ymax - ymin) / self.ny
-        cell_area = dx * dy
-
-        if cell_area <= 0:
-            raise ValueError(f"Invalid grid: bounds={self.bounds}, nx={self.nx}, ny={self.ny}")
+        dx_cells = np.diff(self.x_edges_arr)
+        dy_cells = np.diff(self.y_edges_arr)
+        if dx_cells.min() <= 0 or dy_cells.min() <= 0:
+            raise ValueError(
+                f"Invalid grid: bounds={self.bounds}, nx={self.nx}, ny={self.ny}, "
+                f"custom={self.custom_grid}")
 
         total = self.nx * self.ny
 
@@ -232,22 +313,40 @@ class TraceGridMapper:
 
     @property
     def grid_info(self):
-        """Return grid metadata dict."""
+        """Return grid metadata dict.
+
+        For non-uniform grids, 'dx' / 'dy' report the mean cell size; use
+        'x_edges' / 'y_edges' for per-cell boundaries.
+        """
         xmin, ymin, xmax, ymax = self.bounds
+        x_edges = self.x_edges_arr
+        y_edges = self.y_edges_arr
         return {
             'nx': self.nx, 'ny': self.ny,
             'xmin': xmin, 'ymin': ymin, 'xmax': xmax, 'ymax': ymax,
-            'dx': (xmax - xmin) / self.nx,
-            'dy': (ymax - ymin) / self.ny,
+            'dx': float(np.mean(np.diff(x_edges))),
+            'dy': float(np.mean(np.diff(y_edges))),
+            'x_edges': x_edges,
+            'y_edges': y_edges,
+            'custom': self.custom_grid,
         }
 
     def to_csv(self, filepath: str):
         """Export fractions to CSV (row=Y index, col=X index)."""
         if self.fractions is None:
             self.compute()
-        header = (f"# Trace Mapping Grid: {self.nx}x{self.ny}\n"
-                  f"# Bounds: {self.bounds}\n"
-                  f"# Row=Y(bot->top), Col=X(left->right), Value=copper fraction")
+        header_lines = [
+            f"Trace Mapping Grid: {self.nx}x{self.ny}",
+            f"Bounds: {self.bounds}",
+            f"Grid: {'custom (non-uniform)' if self.custom_grid else 'uniform'}",
+        ]
+        if self.custom_grid:
+            x_edges_str = ','.join(f'{v:.6f}' for v in self.x_edges_arr)
+            y_edges_str = ','.join(f'{v:.6f}' for v in self.y_edges_arr)
+            header_lines.append(f"X edges: {x_edges_str}")
+            header_lines.append(f"Y edges: {y_edges_str}")
+        header_lines.append("Row=Y(bot->top), Col=X(left->right), Value=copper fraction")
+        header = "\n".join(header_lines)
         np.savetxt(filepath, self.fractions, delimiter=',', fmt='%.6f',
                    header=header)
         print(f"Saved: {filepath}")
@@ -256,7 +355,10 @@ class TraceGridMapper:
         """Return list of dicts [{ix, iy, cx, cy, fraction}, ...] for non-zero cells."""
         if self.fractions is None:
             self.compute()
-        info = self.grid_info
+        x_edges = self.x_edges_arr
+        y_edges = self.y_edges_arr
+        cx = 0.5 * (x_edges[:-1] + x_edges[1:])
+        cy = 0.5 * (y_edges[:-1] + y_edges[1:])
         records = []
         for j in range(self.ny):
             for i in range(self.nx):
@@ -264,8 +366,7 @@ class TraceGridMapper:
                 if f > 0:
                     records.append({
                         'ix': i, 'iy': j,
-                        'cx': info['xmin'] + (i + 0.5) * info['dx'],
-                        'cy': info['ymin'] + (j + 0.5) * info['dy'],
+                        'cx': float(cx[i]), 'cy': float(cy[j]),
                         'fraction': f,
                     })
         return records

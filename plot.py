@@ -40,7 +40,11 @@ def plot_copper(layer, ax=None, color='darkorange', alpha=0.7):
 
 
 def plot_fraction_map(mapper, ax=None, cmap='YlOrRd', title=None, show_grid=True):
-    """Plot copper fraction heatmap on the grid."""
+    """Plot copper fraction heatmap on the grid.
+
+    Uses pcolormesh for non-uniform grids so each cell renders at its true
+    size; falls back to the faster imshow for equal-division grids.
+    """
     if mapper.fractions is None:
         mapper.compute()
 
@@ -48,18 +52,23 @@ def plot_fraction_map(mapper, ax=None, cmap='YlOrRd', title=None, show_grid=True
         fig, ax = plt.subplots(1, 1, figsize=(10, 8))
 
     info = mapper.grid_info
-    extent = [info['xmin'], info['xmax'], info['ymin'], info['ymax']]
+    x_edges = info['x_edges']
+    y_edges = info['y_edges']
 
-    im = ax.imshow(mapper.fractions, origin='lower', extent=extent,
-                   cmap=cmap, vmin=0, vmax=1, aspect='equal',
-                   interpolation='nearest')
+    if info.get('custom'):
+        im = ax.pcolormesh(x_edges, y_edges, mapper.fractions,
+                           cmap=cmap, vmin=0, vmax=1, shading='flat')
+        ax.set_aspect('equal')
+    else:
+        extent = [info['xmin'], info['xmax'], info['ymin'], info['ymax']]
+        im = ax.imshow(mapper.fractions, origin='lower', extent=extent,
+                       cmap=cmap, vmin=0, vmax=1, aspect='equal',
+                       interpolation='nearest')
 
     if show_grid:
-        for i in range(mapper.nx + 1):
-            x = info['xmin'] + i * info['dx']
+        for x in x_edges:
             ax.axvline(x, color='gray', lw=0.3, alpha=0.5)
-        for j in range(mapper.ny + 1):
-            y = info['ymin'] + j * info['dy']
+        for y in y_edges:
             ax.axhline(y, color='gray', lw=0.3, alpha=0.5)
 
     plt.colorbar(im, ax=ax, label='Copper Fraction', shrink=0.8)
@@ -132,11 +141,9 @@ def plot_comparison(layer, mapper):
     else:
         ax1.set_facecolor('white')
 
-    for i in range(mapper.nx + 1):
-        x = info['xmin'] + i * info['dx']
+    for x in info['x_edges']:
         ax1.axvline(x, color='gray', lw=0.3, alpha=0.5)
-    for j in range(mapper.ny + 1):
-        y = info['ymin'] + j * info['dy']
+    for y in info['y_edges']:
         ax1.axhline(y, color='gray', lw=0.3, alpha=0.5)
 
     ax1.set_xlim(info['xmin'], info['xmax'])

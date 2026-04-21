@@ -12,6 +12,7 @@ Helpers:
   _exclude_largest_polygons(polys,n) -- remove N largest polygons by area
 """
 
+import csv
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -22,6 +23,33 @@ from trace_grid import TraceGridMapper
 from cache import (CACHE_DIRNAME, _file_identity_hash, _raster_params_hash,
                    _raster_cache_path, _save_raster_cache, _load_raster_cache)
 from plot import plot_comparison, plot_fraction_map
+
+
+def load_grid_csv(path: str) -> np.ndarray:
+    """Load a column-vector CSV of grid coordinates.
+
+    Accepts any cell containing a parseable float; non-numeric rows (e.g.
+    headers) are skipped. Returns a 1D float64 array sorted ascending.
+    Raises ValueError if fewer than 2 distinct values are found.
+    """
+    vals = []
+    with open(path, 'r', newline='') as f:
+        for row in csv.reader(f):
+            for cell in row:
+                s = cell.strip()
+                if not s:
+                    continue
+                try:
+                    vals.append(float(s))
+                except ValueError:
+                    continue
+    if len(vals) < 2:
+        raise ValueError(f"Grid CSV {path!r} must contain at least 2 numeric values")
+    arr = np.array(vals, dtype=np.float64)
+    arr = np.unique(arr)  # sort + dedupe
+    if arr.size < 2:
+        raise ValueError(f"Grid CSV {path!r} must contain at least 2 distinct values")
+    return arr
 
 
 def _exclude_largest_polygons(polys, n):
@@ -80,7 +108,11 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                    export_csv=True, plot=True, show=False, outdir=None,
                    merge_tolerance=0.0, no_merge=False, interactive=False,
                    even_odd=True, exclude_largest=0,
-                   min_display_pixels=600, cache=True):
+                   min_display_pixels=600, cache=True,
+                   x_coords_csv: Optional[str] = None,
+                   y_coords_csv: Optional[str] = None,
+                   x_edges: Optional[np.ndarray] = None,
+                   y_edges: Optional[np.ndarray] = None):
     """
     Process multiple Gerber layer files.
 
@@ -101,12 +133,36 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                Lets you change nx/ny and get instant re-mapping from a
                previously rendered bitmap.  Disabled automatically in
                interactive mode.
+        x_coords_csv / y_coords_csv: Paths to column-vector CSV files
+               containing the X / Y grid edge coordinates for a custom
+               non-uniform grid. When both are provided, nx/ny and
+               shared_bounds are ignored and the grid edges define the
+               bounds and cell boundaries for every layer.
+        x_edges / y_edges: Alternative direct-array form of x_coords_csv /
+               y_coords_csv, primarily for programmatic callers.
     Returns:
         dict: {layer_name: TraceGridMapper}
     """
     if not filepaths:
         print("No files to process.")
         return {}
+
+    # Resolve custom grid edges (CSV paths take precedence over arrays).
+    if x_coords_csv:
+        x_edges = load_grid_csv(x_coords_csv)
+    if y_coords_csv:
+        y_edges = load_grid_csv(y_coords_csv)
+    if (x_edges is None) != (y_edges is None):
+        raise ValueError("Custom grid requires BOTH x and y coordinate sources.")
+    custom_grid = x_edges is not None and y_edges is not None
+    if custom_grid:
+        x_edges = np.asarray(x_edges, dtype=np.float64)
+        y_edges = np.asarray(y_edges, dtype=np.float64)
+        nx = int(x_edges.size - 1)
+        ny = int(y_edges.size - 1)
+        print(f"Custom grid enabled: {nx}x{ny} cells from provided edges "
+              f"(X: {x_edges[0]:.4f}..{x_edges[-1]:.4f}, "
+              f"Y: {y_edges[0]:.4f}..{y_edges[-1]:.4f})")
 
     skip_merge = no_merge or even_odd
     cache_enabled = cache and not interactive
@@ -177,7 +233,12 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         return {}
 
     # --- Step 2: Determine effective bounds per layer -----------------------
-    if bounds is not None:
+    if custom_grid:
+        custom_b = (float(x_edges[0]), float(y_edges[0]),
+                    float(x_edges[-1]), float(y_edges[-1]))
+        effective = {fp: custom_b for fp in own_bounds}
+        print(f"\nUsing custom-grid bounds: {custom_b}")
+    elif bounds is not None:
         effective = {fp: bounds for fp in own_bounds}
         print(f"\nUsing user-specified bounds: {bounds}")
     elif shared_bounds and len(own_bounds) > 1:
@@ -199,6 +260,12 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
 
         raster_params_fp = {**raster_params,
                             'bounds': tuple(round(v, 9) for v in eff_b)}
+        if custom_grid:
+            # Non-uniform rasters are sized by the smallest cell, so the
+            # bitmap shape differs from any uniform-grid cache for the same
+            # bounds/params.  Tag the cache key with the edge signature.
+            raster_params_fp['x_edges'] = [round(float(v), 9) for v in x_edges]
+            raster_params_fp['y_edges'] = [round(float(v), 9) for v in y_edges]
         bitmap = cached_bounds = None
         cached_sub = 0
         r_path = None
@@ -219,24 +286,27 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                 continue
             parsed[fp] = layer
 
+            grid_kw = dict(nx=nx, ny=ny, bounds=eff_b,
+                           min_display_pixels=min_display_pixels)
+            if custom_grid:
+                grid_kw['x_edges'] = x_edges
+                grid_kw['y_edges'] = y_edges
+
             if even_odd:
                 mapper = TraceGridMapper(
                     copper_polys=layer.copper_polys,
-                    nx=nx, ny=ny, bounds=eff_b,
                     even_odd=True,
-                    min_display_pixels=min_display_pixels,
+                    **grid_kw,
                 )
             elif layer.no_merge or layer.copper is None:
                 mapper = TraceGridMapper(
                     copper_polys=layer.copper_polys,
-                    nx=nx, ny=ny, bounds=eff_b,
-                    min_display_pixels=min_display_pixels,
+                    **grid_kw,
                 )
             else:
                 mapper = TraceGridMapper(
                     copper=layer.copper,
-                    nx=nx, ny=ny, bounds=eff_b,
-                    min_display_pixels=min_display_pixels,
+                    **grid_kw,
                 )
             mapper.compute()
 
@@ -245,12 +315,14 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                                    sub=mapper._raster_sub)
                 print(f"  Raster cache saved: {r_path.name}")
         else:
-            # Cache hit: inject bitmap and derive fractions for current nx/ny.
-            mapper = TraceGridMapper(
-                nx=nx, ny=ny, bounds=cached_bounds,
-                even_odd=even_odd,
-                min_display_pixels=min_display_pixels,
-            )
+            # Cache hit: inject bitmap and derive fractions for current grid.
+            grid_kw = dict(nx=nx, ny=ny, bounds=cached_bounds,
+                           even_odd=even_odd,
+                           min_display_pixels=min_display_pixels)
+            if custom_grid:
+                grid_kw['x_edges'] = x_edges
+                grid_kw['y_edges'] = y_edges
+            mapper = TraceGridMapper(**grid_kw)
             mapper._raster_bitmap = bitmap
             mapper._raster_sub = cached_sub
             mapper.compute()

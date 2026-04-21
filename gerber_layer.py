@@ -17,6 +17,61 @@ from typing import Optional
 
 
 # ---------------------------------------------------------------------------
+#  pcb-tools resilience patch
+# ---------------------------------------------------------------------------
+# pcb-tools (unmaintained since 2019) aborts an entire file parse with
+# `KeyError: '<macro-name>'` whenever it meets a %ADDn,<macro>,...% that
+# references an Aperture Macro it failed to register earlier -- typically
+# because the macro uses an unsupported primitive code, arithmetic that
+# eval_macro can't handle, or non-trivial line breaks in the AM body.
+#
+# We tolerate this by installing a zero-diameter Circle placeholder for the
+# offending aperture.  Line/Arc/Flash primitives that later use the
+# placeholder produce an empty Shapely geometry (buffer of 0), which is
+# filtered out by `to_polygons()` alongside its other skip paths.  The
+# result: every usable trace and pad still maps; only the shapes drawn with
+# the broken aperture are silently omitted.
+
+_PCB_TOOLS_PATCHED = False
+
+
+def _install_pcb_tools_resilience():
+    """Monkey-patch GerberParser so unresolvable macro apertures don't
+    blow up the full file parse.  Idempotent across repeated calls."""
+    global _PCB_TOOLS_PATCHED
+    if _PCB_TOOLS_PATCHED:
+        return
+    try:
+        from gerber.rs274x import GerberParser
+        from gerber.primitives import Circle as _GCircle
+    except Exception:
+        # gerber package not importable yet; the caller will fail naturally.
+        return
+
+    _orig = GerberParser._define_aperture
+
+    def _resilient_define_aperture(self, d, shape, modifiers):
+        try:
+            return _orig(self, d, shape, modifiers)
+        except Exception as exc:
+            # Standard shapes (C/R/O/P) parsing errors indicate a genuinely
+            # malformed file -- propagate so the user sees it.
+            if shape in ('C', 'R', 'O', 'P'):
+                raise
+            missing = getattr(self, '_missing_macro_apertures', None)
+            if missing is None:
+                missing = {}
+                self._missing_macro_apertures = missing
+            missing.setdefault(shape, []).append(d)
+            units = getattr(self.settings, 'units', None)
+            self.apertures[d] = _GCircle(position=None, diameter=0.0,
+                                         units=units)
+
+    GerberParser._define_aperture = _resilient_define_aperture
+    _PCB_TOOLS_PATCHED = True
+
+
+# ---------------------------------------------------------------------------
 #  Gerber primitive -> Shapely conversion helpers
 # ---------------------------------------------------------------------------
 
@@ -206,12 +261,34 @@ class GerberLayer:
     _copper_polys: list = field(default_factory=list, repr=False)
 
     def load(self):
-        """Parse the Gerber file using pcb-tools."""
-        from gerber.rs274x import read
+        """Parse the Gerber file using pcb-tools.
+
+        Installs a resilience patch on pcb-tools' parser so a single
+        unresolvable aperture macro does not abort the whole file.
+        """
+        _install_pcb_tools_resilience()
+
+        # Capture any "missing macro" reports from the patched parser.
+        # The patch stores them on the parser instance, but `read()` only
+        # returns the GerberFile, so we intercept GerberParser.parse here.
+        from gerber.rs274x import GerberParser
         print(f"Loading: {self.filepath}")
-        self._parsed = read(self.filepath)
+        parser = GerberParser()
+        self._parsed = parser.parse(self.filepath)
         if not self.name:
             self.name = Path(self.filepath).stem
+
+        missing = getattr(parser, '_missing_macro_apertures', None)
+        if missing:
+            total_d = sum(len(v) for v in missing.values())
+            print(f"  WARNING: {len(missing)} aperture macro(s) could not be "
+                  f"resolved (affects {total_d} aperture definition(s)). "
+                  "Primitives drawn with these apertures will be skipped; "
+                  "the rest of the layer is loaded normally.")
+            for name, d_codes in missing.items():
+                codes = ", ".join(f"D{d}" for d in d_codes)
+                print(f"    - macro {name!r}: {codes}")
+
         print(f"  Bounds: {self._parsed.bounds}")
         print(f"  Primitives: {len(self._parsed.primitives)}")
         return self

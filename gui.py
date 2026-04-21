@@ -10,7 +10,8 @@ root.after() to avoid "main thread is not in main loop" errors.
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from process import process_layers, collect_art_files
+from process import (process_layers, collect_art_files,
+                     load_cached_mappers, CacheMissError)
 from plot import plot_comparison
 from cache import CACHE_DIRNAME
 
@@ -361,6 +362,90 @@ def gui_main():
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def show_saved_plot():
+        """Display interactive plots from cached rasters without re-running.
+
+        Requires a prior successful Run with matching parameters so the
+        meta + raster caches exist. On any cache miss, a messagebox
+        instructs the user to run once first.
+        """
+        paths = list(file_listbox.get(0, tk.END))
+        if not paths:
+            messagebox.showwarning("No files", "Please add at least one Gerber file.")
+            return
+        if not show_var.get():
+            messagebox.showinfo(
+                "Show plots disabled",
+                "Enable 'Show plots' to display interactive figures.")
+            return
+
+        try:
+            nx = int(nx_var.get())
+            ny = int(ny_var.get())
+            merge_tol = float(tol_var.get())
+            disp_pix = max(50, int(disp_var.get()))
+        except ValueError:
+            messagebox.showerror(
+                "Invalid", "NX, NY, merge tolerance, and display pixels "
+                "must be valid numbers.")
+            return
+
+        excl_n = 0
+        if exclude_var.get():
+            try:
+                excl_n = int(exclude_n_var.get())
+            except ValueError:
+                excl_n = 1
+
+        x_csv = x_csv_var.get().strip() or None
+        y_csv = y_csv_var.get().strip() or None
+        if (x_csv is None) != (y_csv is None):
+            messagebox.showerror(
+                "Custom grid",
+                "Please provide BOTH the X and Y coordinate CSV files, "
+                "or leave both empty to use NX/NY.")
+            return
+
+        try:
+            files = collect_art_files(paths)
+            if not files:
+                messagebox.showwarning(
+                    "No files", "No .art / .gbr files found in the given paths.")
+                return
+
+            results = load_cached_mappers(
+                filepaths=files,
+                nx=nx, ny=ny,
+                shared_bounds=shared_bounds_var.get(),
+                merge_tolerance=merge_tol,
+                no_merge=no_merge_var.get(),
+                even_odd=even_odd_var.get(),
+                exclude_largest=excl_n,
+                min_display_pixels=disp_pix,
+                x_coords_csv=x_csv,
+                y_coords_csv=y_csv,
+            )
+        except CacheMissError as e:
+            messagebox.showerror(
+                "No saved plot data",
+                f"{e}\n\nParameters used here must match a previous Run "
+                "(merge tolerance, even-odd, no-merge, exclude count, "
+                "display pixels, shared bounds, custom grid).")
+            return
+        except Exception as e:
+            messagebox.showerror("Error loading cache", str(e))
+            log(f"\nERROR: {e}\n")
+            return
+
+        fp_by_name = {Path(fp).stem: fp for fp in files}
+        for name, mapper in results.items():
+            fp = fp_by_name.get(name)
+            stub = type('LayerStub', (), {
+                'name': name, 'filepath': fp or name})()
+            plot_comparison(stub, mapper)
+            log(f"Loaded saved plot: {name}\n")
+        plt.show()
+
     def clear_cache():
         """Delete .trace_cache directories next to the listed art files."""
         import shutil
@@ -381,6 +466,8 @@ def gui_main():
 
     run_btn = ttk.Button(run_frame, text="Run", command=run_processing)
     run_btn.pack(side='left', padx=4)
+    ttk.Button(run_frame, text="Show Saved Plot",
+               command=show_saved_plot).pack(side='left', padx=4)
     ttk.Button(run_frame, text="Clear Cache", command=clear_cache).pack(
         side='left', padx=4)
     ttk.Button(run_frame, text="Quit", command=root.destroy).pack(side='right', padx=4)

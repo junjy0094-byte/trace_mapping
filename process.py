@@ -372,3 +372,136 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         print(f"Summary plot saved: {summary_path}")
 
     return results
+
+
+class CacheMissError(FileNotFoundError):
+    """Raised by load_cached_mappers when any required cache file is absent."""
+    def __init__(self, missing: List[str], kind: str = "cache"):
+        self.missing = list(missing)
+        self.kind = kind
+        names = ", ".join(Path(m).name for m in missing) or "(none)"
+        super().__init__(
+            f"Missing {kind} for: {names}. "
+            "Run the full processing once first to generate the cache files."
+        )
+
+
+def load_cached_mappers(filepaths: List[str], nx=20, ny=20,
+                        bounds=None, shared_bounds=True,
+                        merge_tolerance=0.0, no_merge=False,
+                        even_odd=True, exclude_largest=0,
+                        min_display_pixels=600,
+                        x_coords_csv: Optional[str] = None,
+                        y_coords_csv: Optional[str] = None,
+                        x_edges: Optional[np.ndarray] = None,
+                        y_edges: Optional[np.ndarray] = None):
+    """Reconstruct TraceGridMapper objects purely from saved cache files.
+
+    Mirrors the cache lookup used by process_layers but never parses a
+    Gerber file. Raises CacheMissError when any requested file lacks its
+    meta or raster cache so the caller can prompt the user to run once.
+
+    Returns: {layer_name: TraceGridMapper}
+    """
+    if not filepaths:
+        raise CacheMissError([], kind="input files")
+
+    if x_coords_csv:
+        x_edges = load_grid_csv(x_coords_csv)
+    if y_coords_csv:
+        y_edges = load_grid_csv(y_coords_csv)
+    if (x_edges is None) != (y_edges is None):
+        raise ValueError("Custom grid requires BOTH x and y coordinate sources.")
+    custom_grid = x_edges is not None and y_edges is not None
+    if custom_grid:
+        x_edges = np.asarray(x_edges, dtype=np.float64)
+        y_edges = np.asarray(y_edges, dtype=np.float64)
+        nx = int(x_edges.size - 1)
+        ny = int(y_edges.size - 1)
+
+    skip_merge = no_merge or even_odd
+    poly_params = {
+        'merge_tolerance': merge_tolerance,
+        'no_merge': skip_merge,
+        'even_odd': even_odd,
+        'exclude_largest': exclude_largest,
+    }
+    raster_params = {**poly_params, 'min_display_pixels': min_display_pixels}
+    meta_p_hash = _raster_params_hash({**poly_params, 'kind': 'meta'})
+
+    # Step 1: meta cache -> per-file bounds (no parsing allowed).
+    own_bounds: dict = {}
+    file_hashes: dict = {}
+    missing_meta: List[str] = []
+    for fp in filepaths:
+        if not Path(fp).exists():
+            missing_meta.append(fp)
+            continue
+        try:
+            f_hash = _file_identity_hash(fp)
+        except OSError:
+            missing_meta.append(fp)
+            continue
+        file_hashes[fp] = f_hash
+        meta_path = _raster_cache_path(fp, f_hash, meta_p_hash, is_meta=True)
+        if not meta_path.exists():
+            missing_meta.append(fp)
+            continue
+        try:
+            with np.load(meta_path, allow_pickle=False) as d:
+                own_bounds[fp] = tuple(d['bounds'].tolist())
+        except Exception:
+            missing_meta.append(fp)
+    if missing_meta:
+        raise CacheMissError(missing_meta, kind="meta cache")
+
+    # Step 2: effective bounds (same rules as process_layers).
+    if custom_grid:
+        custom_b = (float(x_edges[0]), float(y_edges[0]),
+                    float(x_edges[-1]), float(y_edges[-1]))
+        effective = {fp: custom_b for fp in own_bounds}
+    elif bounds is not None:
+        effective = {fp: bounds for fp in own_bounds}
+    elif shared_bounds and len(own_bounds) > 1:
+        all_b = list(own_bounds.values())
+        sb = (min(b[0] for b in all_b), min(b[1] for b in all_b),
+              max(b[2] for b in all_b), max(b[3] for b in all_b))
+        effective = {fp: sb for fp in own_bounds}
+    else:
+        effective = dict(own_bounds)
+
+    # Step 3: raster cache -> mapper (fast path: compute() just derives fractions).
+    results = {}
+    missing_raster: List[str] = []
+    for fp, eff_b in effective.items():
+        raster_params_fp = {**raster_params,
+                            'bounds': tuple(round(v, 9) for v in eff_b)}
+        if custom_grid:
+            raster_params_fp['x_edges'] = [round(float(v), 9) for v in x_edges]
+            raster_params_fp['y_edges'] = [round(float(v), 9) for v in y_edges]
+
+        r_p_hash = _raster_params_hash(raster_params_fp)
+        r_path = _raster_cache_path(fp, file_hashes[fp], r_p_hash,
+                                    min_display_pixels=min_display_pixels)
+        loaded = _load_raster_cache(r_path)
+        if loaded is None:
+            missing_raster.append(fp)
+            continue
+        bitmap, cached_bounds, cached_sub = loaded
+
+        grid_kw = dict(nx=nx, ny=ny, bounds=cached_bounds,
+                       even_odd=even_odd,
+                       min_display_pixels=min_display_pixels)
+        if custom_grid:
+            grid_kw['x_edges'] = x_edges
+            grid_kw['y_edges'] = y_edges
+        mapper = TraceGridMapper(**grid_kw)
+        mapper._raster_bitmap = bitmap
+        mapper._raster_sub = cached_sub
+        mapper.compute()
+        results[Path(fp).stem] = mapper
+
+    if missing_raster:
+        raise CacheMissError(missing_raster, kind="raster cache")
+
+    return results

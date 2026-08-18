@@ -6,6 +6,12 @@ The mapper builds one boolean sub-pixel bitmap and derives two outputs:
 
 Cache integration: process.py saves/loads the bitmap so that the full
 parse+rasterise phase is skipped on repeated runs with the same parameters.
+
+even_odd here is the legacy fill-rule raster heuristic. By default the
+copper geometry handed in via `copper=` has already been resolved from the
+Gerber file's own polarity/region-nesting information (see
+gerber_layer.GerberLayer.copper), so 'merged' mode already renders holes
+correctly and even_odd is only needed for the old approximation.
 """
 
 import numpy as np

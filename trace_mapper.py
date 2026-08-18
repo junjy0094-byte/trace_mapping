@@ -82,10 +82,23 @@ def main():
              'grid fractions are computed using STRtree spatial index. '
              'Best for preserving very fine traces that otherwise merge.')
     merge_group.add_argument(
-        '--no-even-odd', action='store_true',
-        help='Disable even-odd fill rule (default: even-odd is ON). '
-             'With even-odd OFF, overlapping areas are summed (clamped to 1). '
-             'Use this only if hollow shapes are not needed.')
+        '--no-polarity', action='store_true',
+        help='Disable Gerber-polarity-based fill resolution (default: ON). '
+             'Falls back to a blind union of every primitive, ignoring '
+             '%%LPC*%% clear-polarity knockouts and region-nesting holes. '
+             'No effect together with --even-odd or --no-merge.')
+    merge_group.add_argument(
+        '--even-odd', action='store_true',
+        help='Use the legacy even-odd raster heuristic (odd overlap count '
+             '= filled, even = hollow) instead of resolving fill/hole from '
+             'the Gerber file itself. Kept for comparison/troubleshooting; '
+             'polarity-based resolution (the default) is more accurate '
+             'whenever the file carries LPD/LPC or region-hole information.')
+    merge_group.add_argument(
+        '--no-even-odd', action='store_true', help=argparse.SUPPRESS)
+    # ^ deprecated no-op: even-odd has not been the default since polarity-
+    #   based fill resolution replaced it as the default; kept only so old
+    #   scripts/commands don't break.
     parser.add_argument(
         '--exclude-largest', type=int, default=0, metavar='N',
         help='Exclude the N largest polygons (by area) per layer. '
@@ -111,7 +124,8 @@ def main():
         gui_main()
         return
 
-    use_even_odd = not args.no_even_odd
+    use_even_odd = args.even_odd
+    use_polarity = not args.no_polarity
 
     files = collect_art_files(args.paths)
     print(f"\nFound {len(files)} Gerber file(s):")
@@ -130,13 +144,15 @@ def main():
                 print(f"Cleared cache: {c}")
 
     if use_even_odd:
-        print("\nMode: EVEN-ODD (per-cell union with spatial index)")
+        print("\nMode: EVEN-ODD (legacy per-cell overlap heuristic, STRtree spatial index)")
     elif args.no_merge:
         print("\nMode: NO-MERGE (individual polygons, area sum, STRtree spatial index)")
+    elif use_polarity:
+        print("\nMode: POLARITY (Gerber LPD/LPC + region nesting fill resolution)")
     elif args.merge_tolerance > 0:
-        print(f"\nMode: MERGE with tolerance={args.merge_tolerance}")
+        print(f"\nMode: MERGE with tolerance={args.merge_tolerance} (polarity disabled)")
     else:
-        print("\nMode: MERGE (full precision)")
+        print("\nMode: MERGE (full precision, polarity disabled)")
     print()
 
     results = process_layers(
@@ -151,6 +167,7 @@ def main():
         no_merge=args.no_merge,
         interactive=args.interactive,
         even_odd=use_even_odd,
+        use_polarity=use_polarity,
         exclude_largest=args.exclude_largest,
         min_display_pixels=args.display_pixels,
         cache=not args.no_cache,

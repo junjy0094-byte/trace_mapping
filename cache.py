@@ -15,7 +15,7 @@ import numpy as np
 from pathlib import Path
 from typing import Tuple
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 CACHE_DIRNAME = ".trace_cache"
 
 

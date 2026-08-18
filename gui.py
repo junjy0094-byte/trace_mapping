@@ -167,7 +167,8 @@ def gui_main():
     opt_frame = ttk.LabelFrame(root, text="Options")
     opt_frame.pack(fill='x', padx=8, pady=4)
 
-    even_odd_var = tk.BooleanVar(value=True)
+    polarity_var = tk.BooleanVar(value=True)
+    even_odd_var = tk.BooleanVar(value=False)
     no_merge_var = tk.BooleanVar(value=False)
     interactive_var = tk.BooleanVar(value=False)
     shared_bounds_var = tk.BooleanVar(value=True)
@@ -175,12 +176,15 @@ def gui_main():
     plot_var = tk.BooleanVar(value=True)
     show_var = tk.BooleanVar(value=True)
 
-    ttk.Checkbutton(opt_frame, text="Even-Odd fill", variable=even_odd_var).grid(
+    ttk.Checkbutton(opt_frame, text="Use Gerber polarity (recommended)",
+                    variable=polarity_var).grid(
         row=0, column=0, padx=6, pady=2, sticky='w')
-    ttk.Checkbutton(opt_frame, text="No Merge", variable=no_merge_var).grid(
+    ttk.Checkbutton(opt_frame, text="Even-Odd fill (legacy)", variable=even_odd_var).grid(
         row=0, column=1, padx=6, pady=2, sticky='w')
-    ttk.Checkbutton(opt_frame, text="Interactive exclude", variable=interactive_var).grid(
+    ttk.Checkbutton(opt_frame, text="No Merge", variable=no_merge_var).grid(
         row=0, column=2, padx=6, pady=2, sticky='w')
+    ttk.Checkbutton(opt_frame, text="Interactive exclude", variable=interactive_var).grid(
+        row=0, column=3, padx=6, pady=2, sticky='w')
     ttk.Checkbutton(opt_frame, text="Shared bounds", variable=shared_bounds_var).grid(
         row=1, column=0, padx=6, pady=2, sticky='w')
     ttk.Checkbutton(opt_frame, text="Export CSV", variable=export_csv_var).grid(
@@ -277,6 +281,7 @@ def gui_main():
             'no_merge': no_merge_var.get(),
             'interactive': interactive_var.get(),
             'even_odd': even_odd_var.get(),
+            'use_polarity': polarity_var.get(),
             'cache': cache_var.get(),
         }
         do_plot = plot_var.get()
@@ -305,6 +310,7 @@ def gui_main():
                     no_merge=opts['no_merge'],
                     interactive=opts['interactive'],
                     even_odd=opts['even_odd'],
+                    use_polarity=opts['use_polarity'],
                     exclude_largest=excl_n,
                     min_display_pixels=disp_pix,
                     cache=opts['cache'],
@@ -420,6 +426,7 @@ def gui_main():
                 merge_tolerance=merge_tol,
                 no_merge=no_merge_var.get(),
                 even_odd=even_odd_var.get(),
+                use_polarity=polarity_var.get(),
                 exclude_largest=excl_n,
                 min_display_pixels=disp_pix,
                 x_coords_csv=x_csv,
@@ -429,8 +436,8 @@ def gui_main():
             messagebox.showerror(
                 "No saved plot data",
                 f"{e}\n\nParameters used here must match a previous Run "
-                "(merge tolerance, even-odd, no-merge, exclude count, "
-                "display pixels, shared bounds, custom grid).")
+                "(merge tolerance, polarity, even-odd, no-merge, exclude "
+                "count, display pixels, shared bounds, custom grid).")
             return
         except Exception as e:
             messagebox.showerror("Error loading cache", str(e))

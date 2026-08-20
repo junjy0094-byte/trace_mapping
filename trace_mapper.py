@@ -118,6 +118,23 @@ def main():
         help='Delete the .trace_cache directory next to each input path '
              'before running.')
 
+    apdl_group = parser.add_argument_group(
+        'Reference Full Model (APDL)',
+        'Export a full-resolution FEM mesh matching the display panel '
+        'exactly, for validating the coarse equivalent-property grid '
+        'against a ground-truth model.')
+    apdl_group.add_argument(
+        '--reference-full-model', action='store_true',
+        help='Write an APDL macro (.mac) per layer: one 2D element per '
+             'raster sub-pixel, MAT=1 (Cu) / MAT=2 (PPG placeholder '
+             'properties). Element count scales with --display-pixels '
+             'and can be very large -- see --reference-full-stride.')
+    apdl_group.add_argument(
+        '--reference-full-stride', type=int, default=1, metavar='N',
+        help='Use every Nth raster sub-pixel per axis for the reference '
+             'full model instead of all of them, to bound element count. '
+             '1 (default) = exact match to the display panel.')
+
     args = parser.parse_args()
 
     if not args.paths or args.gui:
@@ -153,6 +170,11 @@ def main():
         print(f"\nMode: MERGE with tolerance={args.merge_tolerance} (polarity disabled)")
     else:
         print("\nMode: MERGE (full precision, polarity disabled)")
+
+    if args.reference_full_model:
+        print(f"Reference full model: ON (stride={args.reference_full_stride}) -- "
+              f"element count scales with --display-pixels ({args.display_pixels}); "
+              "this can be a very large mesh.")
     print()
 
     results = process_layers(
@@ -173,6 +195,8 @@ def main():
         cache=not args.no_cache,
         x_coords_csv=args.x_coords_csv,
         y_coords_csv=args.y_coords_csv,
+        export_apdl=args.reference_full_model,
+        apdl_stride=args.reference_full_stride,
     )
 
     if args.show:

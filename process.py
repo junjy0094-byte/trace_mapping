@@ -27,6 +27,7 @@ from trace_grid import TraceGridMapper
 from cache import (CACHE_DIRNAME, _file_identity_hash, _raster_params_hash,
                    _raster_cache_path, _save_raster_cache, _load_raster_cache)
 from plot import plot_comparison, plot_fraction_map
+from apdl_export import write_reference_full_model_apdl
 
 
 def load_grid_csv(path: str) -> np.ndarray:
@@ -96,7 +97,9 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                    x_coords_csv: Optional[str] = None,
                    y_coords_csv: Optional[str] = None,
                    x_edges: Optional[np.ndarray] = None,
-                   y_edges: Optional[np.ndarray] = None):
+                   y_edges: Optional[np.ndarray] = None,
+                   export_apdl: bool = False,
+                   apdl_stride: int = 1):
     """
     Process multiple Gerber layer files.
 
@@ -130,6 +133,15 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                bounds and cell boundaries for every layer.
         x_edges / y_edges: Alternative direct-array form of x_coords_csv /
                y_coords_csv, primarily for programmatic callers.
+        export_apdl: If True, also write an APDL macro (.mac) per layer --
+               the "reference full model": one 2D element per raster
+               sub-pixel, MAT=1 (Cu) / MAT=2 (PPG), matching the display
+               panel exactly. See apdl_export.write_reference_full_model_apdl.
+               Element count scales with min_display_pixels and can be
+               very large; use apdl_stride to bound it.
+        apdl_stride: Use every Nth raster sub-pixel per axis for the
+               reference full model instead of all of them. 1 (default)
+               matches the display panel exactly.
     Returns:
         dict: {layer_name: TraceGridMapper}
     """
@@ -326,6 +338,10 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         if export_csv:
             csv_path = out_base / f"{stem}.csv"
             mapper.to_csv(str(csv_path))
+
+        if export_apdl:
+            apdl_path = out_base / f"{stem}_reference_full.mac"
+            write_reference_full_model_apdl(mapper, str(apdl_path), stride=apdl_stride)
 
         if plot:
             stub = parsed.get(fp) or type('LayerStub', (), {

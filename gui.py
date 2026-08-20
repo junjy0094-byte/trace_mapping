@@ -208,6 +208,20 @@ def gui_main():
     ttk.Checkbutton(opt_frame, text="Use raster cache", variable=cache_var).grid(
         row=2, column=2, padx=6, pady=2, sticky='w')
 
+    apdl_var = tk.BooleanVar(value=False)
+    apdl_stride_var = tk.StringVar(value="1")
+    ttk.Checkbutton(opt_frame, text="Export APDL reference-full model",
+                    variable=apdl_var).grid(
+        row=3, column=0, columnspan=2, padx=6, pady=2, sticky='w')
+    af = tk.Frame(opt_frame)
+    af.grid(row=3, column=2, padx=6, pady=2, sticky='w')
+    ttk.Label(af, text="Stride:").pack(side='left')
+    ttk.Spinbox(af, from_=1, to=50, textvariable=apdl_stride_var,
+                width=4).pack(side='left', padx=2)
+    ttk.Label(opt_frame, text="(one 2D element per raster sub-pixel, MAT=Cu/PPG; "
+                              "can be a very large mesh -- raise stride to shrink it)").grid(
+        row=4, column=0, columnspan=4, padx=6, pady=(0, 2), sticky='w')
+
     # ---- Log output ----
     log_frame = ttk.LabelFrame(root, text="Log")
     log_frame.pack(fill='both', expand=True, padx=8, pady=4)
@@ -256,6 +270,11 @@ def gui_main():
         except ValueError:
             messagebox.showerror("Invalid", "Display pixels must be an integer.")
             return
+        try:
+            apdl_stride = max(1, int(apdl_stride_var.get()))
+        except ValueError:
+            messagebox.showerror("Invalid", "APDL stride must be an integer.")
+            return
 
         outdir = outdir_var.get().strip() or None
         excl_n = 0
@@ -283,6 +302,8 @@ def gui_main():
             'even_odd': even_odd_var.get(),
             'use_polarity': polarity_var.get(),
             'cache': cache_var.get(),
+            'export_apdl': apdl_var.get(),
+            'apdl_stride': apdl_stride,
         }
         do_plot = plot_var.get()
         do_show = show_var.get()
@@ -316,6 +337,8 @@ def gui_main():
                     cache=opts['cache'],
                     x_coords_csv=x_csv,
                     y_coords_csv=y_csv,
+                    export_apdl=opts['export_apdl'],
+                    apdl_stride=opts['apdl_stride'],
                 )
 
                 log("\n=== Summary ===\n")

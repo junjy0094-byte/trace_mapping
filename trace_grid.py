@@ -182,7 +182,7 @@ class TraceGridMapper:
 
         mode: 'even-odd' | 'merged' | 'individual'
         """
-        from matplotlib.path import Path as MplPath
+        import shapely
         from shapely.geometry import Polygon as SP, MultiPolygon as MP
 
         xmin, ymin, xmax, ymax = self.bounds
@@ -239,15 +239,16 @@ class TraceGridMapper:
 
                 sub_x = xs[c0:c1]
                 sub_y = ys[r0:r1]
-                pts = np.empty((sub_y.size * sub_x.size, 2), dtype=np.float64)
-                pts[:, 0] = np.repeat(sub_x[np.newaxis, :], sub_y.size, axis=0).ravel()
-                pts[:, 1] = np.repeat(sub_y[:, np.newaxis], sub_x.size, axis=1).ravel()
+                XX, YY = np.meshgrid(sub_x, sub_y)
 
-                inside = MplPath(np.asarray(sp.exterior.coords)).contains_points(pts)
-                for ring in sp.interiors:
-                    inside &= ~MplPath(np.asarray(ring.coords)).contains_points(pts)
+                # shapely.contains_xy uses GEOS's prepared-geometry predicate
+                # (spatially indexed) rather than a plain per-point ray cast
+                # against every edge, and it already excludes interior rings
+                # (holes) as part of standard polygon containment -- an
+                # order-of-magnitude faster than matplotlib's Path.contains_points
+                # for complex, many-vertex polygons, with no separate hole pass.
+                mask = shapely.contains_xy(sp, XX, YY)
 
-                mask = inside.reshape(r1 - r0, c1 - c0)
                 if mode == "even-odd":
                     grid[r0:r1, c0:c1] += mask
                 else:

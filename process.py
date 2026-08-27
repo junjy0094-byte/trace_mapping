@@ -7,9 +7,13 @@ process_layers() is the main entry point. Workflow:
   Step 4  Multi-layer summary plot (when >1 layer).
 
 Helpers:
-  collect_art_files(paths)           -- resolve file/dir paths to .art/.gbr list
-  compute_shared_bounds(layers)      -- unified bounding box across layers
-  _exclude_largest_polygons(polys,n) -- remove N largest polygons by area
+  collect_art_files(paths)      -- resolve file/dir paths to .art/.gbr list
+  compute_shared_bounds(layers) -- unified bounding box across layers
+
+Default fill resolution: use_polarity=True resolves each layer's copper
+from its own Gerber level polarity (%LPD*%/%LPC*%) and region contour
+nesting -- see gerber_layer.GerberLayer -- instead of the legacy even-odd
+raster heuristic (even_odd=True).
 """
 
 import csv
@@ -23,6 +27,7 @@ from trace_grid import TraceGridMapper
 from cache import (CACHE_DIRNAME, _file_identity_hash, _raster_params_hash,
                    _raster_cache_path, _save_raster_cache, _load_raster_cache)
 from plot import plot_comparison, plot_fraction_map
+from apdl_export import write_reference_full_model_apdl
 
 
 def load_grid_csv(path: str) -> np.ndarray:
@@ -50,26 +55,6 @@ def load_grid_csv(path: str) -> np.ndarray:
     if arr.size < 2:
         raise ValueError(f"Grid CSV {path!r} must contain at least 2 distinct values")
     return arr
-
-
-def _exclude_largest_polygons(polys, n):
-    """Remove the n largest polygons (by area) from the list.
-
-    Useful for discarding outer-border polygons from the Gerber board outline.
-    """
-    if n <= 0 or not polys or n >= len(polys):
-        if n >= len(polys) and polys:
-            print(f"  Warning: exclude count ({n}) >= total polygons ({len(polys)}), "
-                  "skipping exclusion.")
-        return polys
-
-    indexed = sorted(enumerate(polys), key=lambda x: x[1].area, reverse=True)
-    exclude_indices = set(idx for idx, _ in indexed[:n])
-    filtered = [p for i, p in enumerate(polys) if i not in exclude_indices]
-    print(f"  Excluded {n} largest polygon(s) by area:")
-    for idx, poly in indexed[:n]:
-        print(f"    polygon #{idx}: area = {poly.area:.6f}")
-    return filtered
 
 
 def collect_art_files(paths: List[str], extensions=('.art', '.gbr')) -> List[str]:
@@ -107,12 +92,14 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                    bounds=None, shared_bounds=True,
                    export_csv=True, plot=True, show=False, outdir=None,
                    merge_tolerance=0.0, no_merge=False, interactive=False,
-                   even_odd=True, exclude_largest=0,
+                   even_odd=False, use_polarity=True, exclude_largest=0,
                    min_display_pixels=600, cache=True,
                    x_coords_csv: Optional[str] = None,
                    y_coords_csv: Optional[str] = None,
                    x_edges: Optional[np.ndarray] = None,
-                   y_edges: Optional[np.ndarray] = None):
+                   y_edges: Optional[np.ndarray] = None,
+                   export_apdl: bool = False,
+                   apdl_stride: int = 1):
     """
     Process multiple Gerber layer files.
 
@@ -124,8 +111,14 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                          0 = no snapping (default). Larger values merge more.
         no_merge: If True, skip unary_union entirely. Individual polygons are
                   used with STRtree spatial index for grid computation.
-        even_odd: If True (default), apply even-odd fill rule per cell.
-                  Odd overlaps = filled, even overlaps = empty (hollow interior).
+        even_odd: If True, apply the legacy even-odd fill rule per cell
+                  (odd overlaps = filled, even overlaps = empty) instead of
+                  resolving fill/hole from the Gerber file itself. Default
+                  False -- use_polarity below is the modern replacement.
+        use_polarity: If True (default), resolve copper fill/hole from the
+                      Gerber file's own %LPD*%/%LPC*% level polarity and
+                      region contour nesting, instead of guessing via
+                      even-odd. Ignored when even_odd or no_merge is set.
         exclude_largest: Number of largest polygons (by area) to exclude per layer.
                          Useful for removing outer board-outline polygons. 0 = none.
         cache: If True (default), reuse cached sub-pixel rasters keyed on
@@ -140,6 +133,15 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                bounds and cell boundaries for every layer.
         x_edges / y_edges: Alternative direct-array form of x_coords_csv /
                y_coords_csv, primarily for programmatic callers.
+        export_apdl: If True, also write an APDL macro (.mac) per layer --
+               the "reference full model": one 2D element per raster
+               sub-pixel, MAT=1 (Cu) / MAT=2 (PPG), matching the display
+               panel exactly. See apdl_export.write_reference_full_model_apdl.
+               Element count scales with min_display_pixels and can be
+               very large; use apdl_stride to bound it.
+        apdl_stride: Use every Nth raster sub-pixel per axis for the
+               reference full model instead of all of them. 1 (default)
+               matches the display panel exactly.
     Returns:
         dict: {layer_name: TraceGridMapper}
     """
@@ -165,12 +167,15 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
               f"Y: {y_edges[0]:.4f}..{y_edges[-1]:.4f})")
 
     skip_merge = no_merge or even_odd
+    # Polarity resolution only applies when a merge actually happens.
+    effective_use_polarity = use_polarity and not skip_merge
     cache_enabled = cache and not interactive
 
     poly_params = {
         'merge_tolerance': merge_tolerance,
         'no_merge': skip_merge,
         'even_odd': even_odd,
+        'use_polarity': effective_use_polarity,
         'exclude_largest': exclude_largest,
     }
     raster_params = {
@@ -183,12 +188,12 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
             layer = GerberLayer(filepath=fp,
                                 merge_tolerance=merge_tolerance,
                                 no_merge=skip_merge,
-                                interactive=interactive)
+                                interactive=interactive,
+                                use_polarity=effective_use_polarity)
             layer.load()
             layer.to_polygons()
             if exclude_largest > 0 and layer.copper_polys:
-                layer._copper_polys = _exclude_largest_polygons(
-                    layer.copper_polys, exclude_largest)
+                layer.exclude_largest_polygons(exclude_largest)
             return layer
         except Exception as e:
             print(f"  ERROR loading {fp}: {e}")
@@ -334,6 +339,10 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
             csv_path = out_base / f"{stem}.csv"
             mapper.to_csv(str(csv_path))
 
+        if export_apdl:
+            apdl_path = out_base / f"{stem}_reference_full.mac"
+            write_reference_full_model_apdl(mapper, str(apdl_path), stride=apdl_stride)
+
         if plot:
             stub = parsed.get(fp) or type('LayerStub', (), {
                 'name': name, 'filepath': fp,
@@ -389,7 +398,7 @@ class CacheMissError(FileNotFoundError):
 def load_cached_mappers(filepaths: List[str], nx=20, ny=20,
                         bounds=None, shared_bounds=True,
                         merge_tolerance=0.0, no_merge=False,
-                        even_odd=True, exclude_largest=0,
+                        even_odd=False, use_polarity=True, exclude_largest=0,
                         min_display_pixels=600,
                         x_coords_csv: Optional[str] = None,
                         y_coords_csv: Optional[str] = None,
@@ -420,10 +429,12 @@ def load_cached_mappers(filepaths: List[str], nx=20, ny=20,
         ny = int(y_edges.size - 1)
 
     skip_merge = no_merge or even_odd
+    effective_use_polarity = use_polarity and not skip_merge
     poly_params = {
         'merge_tolerance': merge_tolerance,
         'no_merge': skip_merge,
         'even_odd': even_odd,
+        'use_polarity': effective_use_polarity,
         'exclude_largest': exclude_largest,
     }
     raster_params = {**poly_params, 'min_display_pixels': min_display_pixels}

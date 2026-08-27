@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 from process import (process_layers, collect_art_files,
-                     load_cached_mappers, CacheMissError)
+                     load_cached_mappers, CacheMissError, normalize_bounds)
 from plot import plot_comparison
 from cache import CACHE_DIRNAME
 
@@ -103,6 +103,50 @@ def gui_main():
               text="(raster across the board's longer axis; pixels stay "
                    "square. larger=sharper/slower)").grid(
         row=1, column=2, columnspan=4, padx=4, pady=2, sticky='w')
+
+    # ---- Explicit mapping bounds (optional) ----
+    bounds_frame = ttk.LabelFrame(
+        root, text="Mapping Bounds (optional: blank = read from the Gerber files)")
+    bounds_frame.pack(fill='x', padx=8, pady=4)
+
+    bounds_vars = {k: tk.StringVar(value="") for k in ("xmin", "ymin", "xmax", "ymax")}
+    for col, key in enumerate(("xmin", "ymin", "xmax", "ymax")):
+        ttk.Label(bounds_frame, text=f"{key.upper()}:").grid(
+            row=0, column=col * 2, padx=(8, 2), pady=4, sticky='e')
+        ttk.Entry(bounds_frame, textvariable=bounds_vars[key], width=12).grid(
+            row=0, column=col * 2 + 1, padx=(0, 4), pady=4)
+
+    def clear_bounds():
+        for v in bounds_vars.values():
+            v.set("")
+
+    ttk.Button(bounds_frame, text="Clear", command=clear_bounds).grid(
+        row=0, column=8, padx=6, pady=4)
+    ttk.Label(bounds_frame,
+              text="(applied to every layer; overrides Shared bounds)").grid(
+        row=0, column=9, padx=6, pady=4, sticky='w')
+
+    def read_bounds():
+        """(xmin, ymin, xmax, ymax) from the entries, or None when all blank.
+
+        Raises ValueError with a message fit for a dialog.
+        """
+        raw = {k: v.get().strip() for k, v in bounds_vars.items()}
+        filled = [k for k, v in raw.items() if v]
+        if not filled:
+            return None
+        if len(filled) != 4:
+            missing = [k.upper() for k in ("xmin", "ymin", "xmax", "ymax")
+                       if not raw[k]]
+            raise ValueError(
+                "Mapping bounds need all four values; missing: "
+                + ", ".join(missing) + ".\nLeave all four blank to read the "
+                "bounds from the Gerber files instead.")
+        try:
+            vals = [float(raw[k]) for k in ("xmin", "ymin", "xmax", "ymax")]
+        except ValueError:
+            raise ValueError("Mapping bounds must all be numbers.")
+        return normalize_bounds(vals)
 
     # ---- Custom grid (non-uniform cell edges from CSV) ----
     custom_frame = ttk.LabelFrame(
@@ -295,6 +339,12 @@ def gui_main():
                 "or leave both empty to use NX/NY.")
             return
 
+        try:
+            user_bounds = read_bounds()
+        except ValueError as e:
+            messagebox.showerror("Mapping bounds", str(e))
+            return
+
         # Snapshot all Tk vars on the main thread; Tk is not thread-safe.
         opts = {
             'shared_bounds': shared_bounds_var.get(),
@@ -324,6 +374,7 @@ def gui_main():
                 results = process_layers(
                     filepaths=files,
                     nx=nx, ny=ny,
+                    bounds=user_bounds,
                     shared_bounds=opts['shared_bounds'],
                     export_csv=opts['export_csv'],
                     plot=False,
@@ -404,11 +455,9 @@ def gui_main():
         if not paths:
             messagebox.showwarning("No files", "Please add at least one Gerber file.")
             return
-        if not show_var.get():
-            messagebox.showinfo(
-                "Show plots disabled",
-                "Enable 'Show plots' to display interactive figures.")
-            return
+        # The 'Show plots' checkbox governs what a Run does with its figures;
+        # this button's whole purpose is to display them, so it does not gate
+        # on that checkbox.
 
         try:
             nx = int(nx_var.get())
@@ -438,6 +487,12 @@ def gui_main():
             return
 
         try:
+            user_bounds = read_bounds()
+        except ValueError as e:
+            messagebox.showerror("Mapping bounds", str(e))
+            return
+
+        try:
             files = collect_art_files(paths)
             if not files:
                 messagebox.showwarning(
@@ -447,6 +502,7 @@ def gui_main():
             results = load_cached_mappers(
                 filepaths=files,
                 nx=nx, ny=ny,
+                bounds=user_bounds,
                 shared_bounds=shared_bounds_var.get(),
                 merge_tolerance=merge_tol,
                 no_merge=no_merge_var.get(),
@@ -462,7 +518,9 @@ def gui_main():
                 "No saved plot data",
                 f"{e}\n\nParameters used here must match a previous Run "
                 "(merge tolerance, polarity, even-odd, no-merge, exclude "
-                "count, display pixels, shared bounds, custom grid).")
+                "count, display pixels, mapping bounds, shared bounds, "
+                "custom grid) -- and the same set of files, since shared "
+                "bounds depend on which layers are listed.")
             return
         except Exception as e:
             messagebox.showerror("Error loading cache", str(e))

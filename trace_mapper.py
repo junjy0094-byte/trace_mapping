@@ -56,6 +56,15 @@ def main():
                              '--x-coords-csv).')
     parser.add_argument('--no-shared-bounds', action='store_true',
                         help='Use per-layer bounds instead of unified bounds')
+    parser.add_argument('--bounds', type=float, nargs=4, default=None,
+                        metavar=('XMIN', 'YMIN', 'XMAX', 'YMAX'),
+                        help='Map every layer over this explicit bounding box '
+                             'instead of the extents read from the Gerber '
+                             'files. Applies to all layers, so grids line up '
+                             'across runs and across boards. Overrides '
+                             '--no-shared-bounds; ignored with a custom '
+                             'coordinate grid, whose CSVs already fix the '
+                             'bounds. e.g. --bounds 0 0 150 100')
     parser.add_argument('--outdir', type=str, default=None,
                         help='Output directory for CSV/PNG (default: same as input)')
     parser.add_argument('--no-plot', action='store_true', help='Skip plot generation')
@@ -182,6 +191,7 @@ def main():
     results = process_layers(
         filepaths=files,
         nx=args.nx, ny=args.ny,
+        bounds=args.bounds,
         shared_bounds=not args.no_shared_bounds,
         export_csv=not args.no_csv,
         plot=not args.no_plot,

@@ -841,8 +841,6 @@ class GerberLayer:
         ignoring polarity/nesting (legacy behavior; kept for comparison
         and for non-Gerber-polarity troubleshooting).
         """
-        from shapely.ops import unary_union
-
         polys = self._copper_polys
 
         if self.use_polarity:

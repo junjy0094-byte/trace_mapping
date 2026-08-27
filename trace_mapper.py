@@ -56,6 +56,15 @@ def main():
                              '--x-coords-csv).')
     parser.add_argument('--no-shared-bounds', action='store_true',
                         help='Use per-layer bounds instead of unified bounds')
+    parser.add_argument('--bounds', type=float, nargs=4, default=None,
+                        metavar=('XMIN', 'YMIN', 'XMAX', 'YMAX'),
+                        help='Map every layer over this explicit bounding box '
+                             'instead of the extents read from the Gerber '
+                             'files. Applies to all layers, so grids line up '
+                             'across runs and across boards. Overrides '
+                             '--no-shared-bounds; ignored with a custom '
+                             'coordinate grid, whose CSVs already fix the '
+                             'bounds. e.g. --bounds 0 0 150 100')
     parser.add_argument('--outdir', type=str, default=None,
                         help='Output directory for CSV/PNG (default: same as input)')
     parser.add_argument('--no-plot', action='store_true', help='Skip plot generation')
@@ -105,9 +114,11 @@ def main():
              'Useful for removing outer board-outline polygons. (default: 0)')
     parser.add_argument(
         '--display-pixels', type=int, default=600, metavar='N',
-        help='Minimum sub-pixel raster size per axis for the left-panel '
-             'display (default: 600). Larger = sharper detail, slower '
-             '(cost ~quadratic). e.g. 1200, 2000, 4000.')
+        help='Minimum sub-pixel raster size along the board\'s longer axis '
+             'for the left-panel display (default: 600). The shorter axis '
+             'is sized from it so sub-pixels stay square whatever the board '
+             'aspect ratio. Larger = sharper detail, slower (cost '
+             '~quadratic). e.g. 1200, 2000, 4000.')
     parser.add_argument(
         '--no-cache', action='store_true',
         help='Disable reuse of cached sub-pixel rasters. By default, the '
@@ -180,6 +191,7 @@ def main():
     results = process_layers(
         filepaths=files,
         nx=args.nx, ny=args.ny,
+        bounds=args.bounds,
         shared_bounds=not args.no_shared_bounds,
         export_csv=not args.no_csv,
         plot=not args.no_plot,

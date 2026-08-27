@@ -10,6 +10,11 @@ Helpers:
   collect_art_files(paths)      -- resolve file/dir paths to .art/.gbr list
   compute_shared_bounds(layers) -- unified bounding box across layers
 
+Bounds: each layer's extents come from its Gerber file by default, shared
+across layers when shared_bounds=True. Passing `bounds` (CLI --bounds, or
+the GUI's Mapping Bounds fields) overrides both and maps every layer over
+one explicit box, so grids line up across runs and across boards.
+
 Default fill resolution: use_polarity=True resolves each layer's copper
 from its own Gerber level polarity (%LPD*%/%LPC*%) and region contour
 nesting -- see gerber_layer.GerberLayer -- instead of the legacy even-odd
@@ -19,6 +24,7 @@ raster heuristic (even_odd=True).
 import csv
 import numpy as np
 import matplotlib.pyplot as plt
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
@@ -88,6 +94,146 @@ def compute_shared_bounds(layers: List[GerberLayer]):
     return (xmin, ymin, xmax, ymax)
 
 
+def normalize_bounds(bounds):
+    """Validate a user-supplied bounding box -> (xmin, ymin, xmax, ymax) floats.
+
+    None passes through, meaning "derive the bounds from the Gerber files".
+    """
+    if bounds is None:
+        return None
+    vals = [float(v) for v in bounds]
+    if len(vals) != 4:
+        raise ValueError(
+            f"bounds needs exactly 4 numbers (xmin ymin xmax ymax), got {len(vals)}")
+    xmin, ymin, xmax, ymax = vals
+    if not (xmax > xmin and ymax > ymin):
+        raise ValueError(
+            f"invalid bounds {tuple(vals)}: require xmin < xmax and ymin < ymax")
+    return (xmin, ymin, xmax, ymax)
+
+
+@dataclass
+class _GridContext:
+    """Resolved grid geometry plus the parameter sets that key the caches.
+
+    process_layers() (which writes caches) and load_cached_mappers() (which
+    reads them for "Show Saved Plot") have to agree on every one of these,
+    or a Run produces caches the viewer cannot find. They used to derive
+    them from two parallel copies of the same code; deriving them once here
+    is what keeps the two in step.
+    """
+    nx: int
+    ny: int
+    x_edges: Optional[np.ndarray]
+    y_edges: Optional[np.ndarray]
+    custom_grid: bool
+    skip_merge: bool
+    use_polarity: bool
+    min_display_pixels: int
+    poly_params: dict
+    raster_params: dict
+
+    def meta_path(self, filepath, file_hash):
+        """Cache file holding this layer's own bounds (no raster)."""
+        return _raster_cache_path(
+            filepath, file_hash,
+            _raster_params_hash({**self.poly_params, 'kind': 'meta'}),
+            is_meta=True)
+
+    def raster_path(self, filepath, file_hash, eff_bounds):
+        """Cache file holding this layer's sub-pixel bitmap."""
+        params = {**self.raster_params,
+                  'bounds': tuple(round(float(v), 9) for v in eff_bounds)}
+        if self.custom_grid:
+            # Non-uniform rasters are sized by the smallest cell, so the
+            # bitmap shape differs from any uniform-grid cache for the same
+            # bounds/params. Tag the key with the edge signature.
+            params['x_edges'] = [round(float(v), 9) for v in self.x_edges]
+            params['y_edges'] = [round(float(v), 9) for v in self.y_edges]
+        return _raster_cache_path(filepath, file_hash,
+                                  _raster_params_hash(params),
+                                  min_display_pixels=self.min_display_pixels)
+
+    def grid_kwargs(self, bounds, even_odd):
+        """TraceGridMapper constructor arguments for this grid."""
+        kw = dict(nx=self.nx, ny=self.ny, bounds=bounds, even_odd=even_odd,
+                  min_display_pixels=self.min_display_pixels)
+        if self.custom_grid:
+            kw['x_edges'] = self.x_edges
+            kw['y_edges'] = self.y_edges
+        return kw
+
+    def effective_bounds(self, own_bounds, bounds, shared_bounds, verbose=False):
+        """Map each file to the bounding box its grid should span.
+
+        User-supplied `bounds` wins over both the shared box and each
+        layer's own, so one explicit box can be applied across every layer.
+        """
+        if self.custom_grid:
+            box = (float(self.x_edges[0]), float(self.y_edges[0]),
+                   float(self.x_edges[-1]), float(self.y_edges[-1]))
+            if verbose:
+                print(f"\nUsing custom-grid bounds: {box}")
+            return {fp: box for fp in own_bounds}
+        if bounds is not None:
+            box = normalize_bounds(bounds)
+            if verbose:
+                print(f"\nUsing user-specified bounds: {box}")
+            return {fp: box for fp in own_bounds}
+        if shared_bounds and len(own_bounds) > 1:
+            all_b = list(own_bounds.values())
+            box = (min(b[0] for b in all_b), min(b[1] for b in all_b),
+                   max(b[2] for b in all_b), max(b[3] for b in all_b))
+            if verbose:
+                print(f"\nShared bounds across {len(own_bounds)} layers: {box}")
+            return {fp: box for fp in own_bounds}
+        return dict(own_bounds)
+
+
+def _build_grid_context(nx, ny, merge_tolerance, no_merge, even_odd,
+                        use_polarity, exclude_largest, min_display_pixels,
+                        x_coords_csv=None, y_coords_csv=None,
+                        x_edges=None, y_edges=None, verbose=False):
+    """Resolve grid edges and cache parameters once, for both entry points."""
+    if x_coords_csv:
+        x_edges = load_grid_csv(x_coords_csv)
+    if y_coords_csv:
+        y_edges = load_grid_csv(y_coords_csv)
+    if (x_edges is None) != (y_edges is None):
+        raise ValueError("Custom grid requires BOTH x and y coordinate sources.")
+
+    custom_grid = x_edges is not None and y_edges is not None
+    if custom_grid:
+        x_edges = np.asarray(x_edges, dtype=np.float64)
+        y_edges = np.asarray(y_edges, dtype=np.float64)
+        nx = int(x_edges.size - 1)
+        ny = int(y_edges.size - 1)
+        if verbose:
+            print(f"Custom grid enabled: {nx}x{ny} cells from provided edges "
+                  f"(X: {x_edges[0]:.4f}..{x_edges[-1]:.4f}, "
+                  f"Y: {y_edges[0]:.4f}..{y_edges[-1]:.4f})")
+
+    skip_merge = no_merge or even_odd
+    # Polarity resolution only applies when a merge actually happens.
+    effective_use_polarity = use_polarity and not skip_merge
+
+    poly_params = {
+        'merge_tolerance': merge_tolerance,
+        'no_merge': skip_merge,
+        'even_odd': even_odd,
+        'use_polarity': effective_use_polarity,
+        'exclude_largest': exclude_largest,
+    }
+    return _GridContext(
+        nx=nx, ny=ny, x_edges=x_edges, y_edges=y_edges,
+        custom_grid=custom_grid, skip_merge=skip_merge,
+        use_polarity=effective_use_polarity,
+        min_display_pixels=min_display_pixels,
+        poly_params=poly_params,
+        raster_params={**poly_params, 'min_display_pixels': min_display_pixels},
+    )
+
+
 def process_layers(filepaths: List[str], nx=20, ny=20,
                    bounds=None, shared_bounds=True,
                    export_csv=True, plot=True, show=False, outdir=None,
@@ -104,8 +250,15 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
     Process multiple Gerber layer files.
 
     Args:
+        bounds: Explicit (xmin, ymin, xmax, ymax) to map every layer over,
+                instead of the extents read from the Gerber files. Takes
+                precedence over shared_bounds, so one box applies to all
+                layers and stays identical across runs; ignored when a
+                custom coordinate grid is given, since its edges already
+                fix the bounds.
         shared_bounds: If True (default), all layers share one bounding box
-                       so that grid cells align across layers.
+                       so that grid cells align across layers. Only consulted
+                       when `bounds` is None.
         outdir: Output directory for CSV/PNG. Default = same dir as input file.
         merge_tolerance: Coordinate grid size for set_precision before union.
                          0 = no snapping (default). Larger values merge more.
@@ -149,39 +302,16 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         print("No files to process.")
         return {}
 
-    # Resolve custom grid edges (CSV paths take precedence over arrays).
-    if x_coords_csv:
-        x_edges = load_grid_csv(x_coords_csv)
-    if y_coords_csv:
-        y_edges = load_grid_csv(y_coords_csv)
-    if (x_edges is None) != (y_edges is None):
-        raise ValueError("Custom grid requires BOTH x and y coordinate sources.")
-    custom_grid = x_edges is not None and y_edges is not None
-    if custom_grid:
-        x_edges = np.asarray(x_edges, dtype=np.float64)
-        y_edges = np.asarray(y_edges, dtype=np.float64)
-        nx = int(x_edges.size - 1)
-        ny = int(y_edges.size - 1)
-        print(f"Custom grid enabled: {nx}x{ny} cells from provided edges "
-              f"(X: {x_edges[0]:.4f}..{x_edges[-1]:.4f}, "
-              f"Y: {y_edges[0]:.4f}..{y_edges[-1]:.4f})")
-
-    skip_merge = no_merge or even_odd
-    # Polarity resolution only applies when a merge actually happens.
-    effective_use_polarity = use_polarity and not skip_merge
+    bounds = normalize_bounds(bounds)
+    ctx = _build_grid_context(
+        nx, ny, merge_tolerance, no_merge, even_odd, use_polarity,
+        exclude_largest, min_display_pixels,
+        x_coords_csv, y_coords_csv, x_edges, y_edges, verbose=True)
+    nx, ny = ctx.nx, ctx.ny
+    x_edges, y_edges = ctx.x_edges, ctx.y_edges
+    skip_merge = ctx.skip_merge
+    effective_use_polarity = ctx.use_polarity
     cache_enabled = cache and not interactive
-
-    poly_params = {
-        'merge_tolerance': merge_tolerance,
-        'no_merge': skip_merge,
-        'even_odd': even_odd,
-        'use_polarity': effective_use_polarity,
-        'exclude_largest': exclude_largest,
-    }
-    raster_params = {
-        **poly_params,
-        'min_display_pixels': min_display_pixels,
-    }
 
     def _parse_layer(fp: str) -> Optional[GerberLayer]:
         try:
@@ -212,8 +342,7 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         if cache_enabled:
             f_hash = _file_identity_hash(fp)
             file_hashes[fp] = f_hash
-            meta_p_hash = _raster_params_hash({**poly_params, 'kind': 'meta'})
-            meta_path = _raster_cache_path(fp, f_hash, meta_p_hash, is_meta=True)
+            meta_path = ctx.meta_path(fp, f_hash)
             if meta_path.exists():
                 try:
                     with np.load(meta_path, allow_pickle=False) as d:
@@ -238,22 +367,8 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         return {}
 
     # --- Step 2: Determine effective bounds per layer -----------------------
-    if custom_grid:
-        custom_b = (float(x_edges[0]), float(y_edges[0]),
-                    float(x_edges[-1]), float(y_edges[-1]))
-        effective = {fp: custom_b for fp in own_bounds}
-        print(f"\nUsing custom-grid bounds: {custom_b}")
-    elif bounds is not None:
-        effective = {fp: bounds for fp in own_bounds}
-        print(f"\nUsing user-specified bounds: {bounds}")
-    elif shared_bounds and len(own_bounds) > 1:
-        all_b = list(own_bounds.values())
-        sb = (min(b[0] for b in all_b), min(b[1] for b in all_b),
-              max(b[2] for b in all_b), max(b[3] for b in all_b))
-        effective = {fp: sb for fp in own_bounds}
-        print(f"\nShared bounds across {len(own_bounds)} layers: {sb}")
-    else:
-        effective = dict(own_bounds)
+    effective = ctx.effective_bounds(own_bounds, bounds, shared_bounds,
+                                     verbose=True)
 
     # --- Step 3: Per-layer raster (from cache or fresh) + fractions --------
     results = {}
@@ -263,22 +378,12 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
     for fp, eff_b in effective.items():
         name = Path(fp).stem
 
-        raster_params_fp = {**raster_params,
-                            'bounds': tuple(round(v, 9) for v in eff_b)}
-        if custom_grid:
-            # Non-uniform rasters are sized by the smallest cell, so the
-            # bitmap shape differs from any uniform-grid cache for the same
-            # bounds/params.  Tag the cache key with the edge signature.
-            raster_params_fp['x_edges'] = [round(float(v), 9) for v in x_edges]
-            raster_params_fp['y_edges'] = [round(float(v), 9) for v in y_edges]
         bitmap = cached_bounds = None
-        cached_sub = 0
+        cached_sub = (0, 0)
         r_path = None
         if cache_enabled:
             f_hash = file_hashes.get(fp) or _file_identity_hash(fp)
-            r_p_hash = _raster_params_hash(raster_params_fp)
-            r_path = _raster_cache_path(fp, f_hash, r_p_hash,
-                                        min_display_pixels=min_display_pixels)
+            r_path = ctx.raster_path(fp, f_hash, eff_b)
             loaded = _load_raster_cache(r_path)
             if loaded is not None:
                 bitmap, cached_bounds, cached_sub = loaded
@@ -291,11 +396,8 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                 continue
             parsed[fp] = layer
 
-            grid_kw = dict(nx=nx, ny=ny, bounds=eff_b,
-                           min_display_pixels=min_display_pixels)
-            if custom_grid:
-                grid_kw['x_edges'] = x_edges
-                grid_kw['y_edges'] = y_edges
+            grid_kw = ctx.grid_kwargs(eff_b, even_odd)
+            grid_kw.pop('even_odd')
 
             if even_odd:
                 mapper = TraceGridMapper(
@@ -321,13 +423,7 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                 print(f"  Raster cache saved: {r_path.name}")
         else:
             # Cache hit: inject bitmap and derive fractions for current grid.
-            grid_kw = dict(nx=nx, ny=ny, bounds=cached_bounds,
-                           even_odd=even_odd,
-                           min_display_pixels=min_display_pixels)
-            if custom_grid:
-                grid_kw['x_edges'] = x_edges
-                grid_kw['y_edges'] = y_edges
-            mapper = TraceGridMapper(**grid_kw)
+            mapper = TraceGridMapper(**ctx.grid_kwargs(cached_bounds, even_odd))
             mapper._raster_bitmap = bitmap
             mapper._raster_sub = cached_sub
             mapper.compute()
@@ -385,14 +481,18 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
 
 class CacheMissError(FileNotFoundError):
     """Raised by load_cached_mappers when any required cache file is absent."""
-    def __init__(self, missing: List[str], kind: str = "cache"):
+    def __init__(self, missing: List[str], kind: str = "cache", expected=None):
         self.missing = list(missing)
         self.kind = kind
+        self.expected = list(expected) if expected else []
         names = ", ".join(Path(m).name for m in missing) or "(none)"
-        super().__init__(
-            f"Missing {kind} for: {names}. "
-            "Run the full processing once first to generate the cache files."
-        )
+        msg = (f"Missing {kind} for: {names}. "
+               "Run the full processing once first to generate the cache files.")
+        if self.expected:
+            # The filename carries the parameter hash, so showing it tells the
+            # user their settings no longer match the Run that wrote the cache.
+            msg += "\nLooked for: " + ", ".join(self.expected)
+        super().__init__(msg)
 
 
 def load_cached_mappers(filepaths: List[str], nx=20, ny=20,
@@ -406,39 +506,25 @@ def load_cached_mappers(filepaths: List[str], nx=20, ny=20,
                         y_edges: Optional[np.ndarray] = None):
     """Reconstruct TraceGridMapper objects purely from saved cache files.
 
-    Mirrors the cache lookup used by process_layers but never parses a
-    Gerber file. Raises CacheMissError when any requested file lacks its
-    meta or raster cache so the caller can prompt the user to run once.
+    Shares _build_grid_context() with process_layers, so the cache keys the
+    two derive are the same by construction rather than by two copies of the
+    same code staying in step. Every argument that affects a key -- `bounds`
+    included -- must match the Run that wrote the cache.
+
+    Raises CacheMissError when any requested file lacks its meta or raster
+    cache so the caller can prompt the user to run once.
 
     Returns: {layer_name: TraceGridMapper}
     """
     if not filepaths:
         raise CacheMissError([], kind="input files")
 
-    if x_coords_csv:
-        x_edges = load_grid_csv(x_coords_csv)
-    if y_coords_csv:
-        y_edges = load_grid_csv(y_coords_csv)
-    if (x_edges is None) != (y_edges is None):
-        raise ValueError("Custom grid requires BOTH x and y coordinate sources.")
-    custom_grid = x_edges is not None and y_edges is not None
-    if custom_grid:
-        x_edges = np.asarray(x_edges, dtype=np.float64)
-        y_edges = np.asarray(y_edges, dtype=np.float64)
-        nx = int(x_edges.size - 1)
-        ny = int(y_edges.size - 1)
-
-    skip_merge = no_merge or even_odd
-    effective_use_polarity = use_polarity and not skip_merge
-    poly_params = {
-        'merge_tolerance': merge_tolerance,
-        'no_merge': skip_merge,
-        'even_odd': even_odd,
-        'use_polarity': effective_use_polarity,
-        'exclude_largest': exclude_largest,
-    }
-    raster_params = {**poly_params, 'min_display_pixels': min_display_pixels}
-    meta_p_hash = _raster_params_hash({**poly_params, 'kind': 'meta'})
+    bounds = normalize_bounds(bounds)
+    ctx = _build_grid_context(
+        nx, ny, merge_tolerance, no_merge, even_odd, use_polarity,
+        exclude_largest, min_display_pixels,
+        x_coords_csv, y_coords_csv, x_edges, y_edges)
+    nx, ny = ctx.nx, ctx.ny
 
     # Step 1: meta cache -> per-file bounds (no parsing allowed).
     own_bounds: dict = {}
@@ -454,7 +540,7 @@ def load_cached_mappers(filepaths: List[str], nx=20, ny=20,
             missing_meta.append(fp)
             continue
         file_hashes[fp] = f_hash
-        meta_path = _raster_cache_path(fp, f_hash, meta_p_hash, is_meta=True)
+        meta_path = ctx.meta_path(fp, f_hash)
         if not meta_path.exists():
             missing_meta.append(fp)
             continue
@@ -466,53 +552,30 @@ def load_cached_mappers(filepaths: List[str], nx=20, ny=20,
     if missing_meta:
         raise CacheMissError(missing_meta, kind="meta cache")
 
-    # Step 2: effective bounds (same rules as process_layers).
-    if custom_grid:
-        custom_b = (float(x_edges[0]), float(y_edges[0]),
-                    float(x_edges[-1]), float(y_edges[-1]))
-        effective = {fp: custom_b for fp in own_bounds}
-    elif bounds is not None:
-        effective = {fp: bounds for fp in own_bounds}
-    elif shared_bounds and len(own_bounds) > 1:
-        all_b = list(own_bounds.values())
-        sb = (min(b[0] for b in all_b), min(b[1] for b in all_b),
-              max(b[2] for b in all_b), max(b[3] for b in all_b))
-        effective = {fp: sb for fp in own_bounds}
-    else:
-        effective = dict(own_bounds)
+    # Step 2: effective bounds (identical rules to process_layers).
+    effective = ctx.effective_bounds(own_bounds, bounds, shared_bounds)
 
     # Step 3: raster cache -> mapper (fast path: compute() just derives fractions).
     results = {}
     missing_raster: List[str] = []
     for fp, eff_b in effective.items():
-        raster_params_fp = {**raster_params,
-                            'bounds': tuple(round(v, 9) for v in eff_b)}
-        if custom_grid:
-            raster_params_fp['x_edges'] = [round(float(v), 9) for v in x_edges]
-            raster_params_fp['y_edges'] = [round(float(v), 9) for v in y_edges]
-
-        r_p_hash = _raster_params_hash(raster_params_fp)
-        r_path = _raster_cache_path(fp, file_hashes[fp], r_p_hash,
-                                    min_display_pixels=min_display_pixels)
+        r_path = ctx.raster_path(fp, file_hashes[fp], eff_b)
         loaded = _load_raster_cache(r_path)
         if loaded is None:
             missing_raster.append(fp)
             continue
         bitmap, cached_bounds, cached_sub = loaded
 
-        grid_kw = dict(nx=nx, ny=ny, bounds=cached_bounds,
-                       even_odd=even_odd,
-                       min_display_pixels=min_display_pixels)
-        if custom_grid:
-            grid_kw['x_edges'] = x_edges
-            grid_kw['y_edges'] = y_edges
-        mapper = TraceGridMapper(**grid_kw)
+        mapper = TraceGridMapper(**ctx.grid_kwargs(cached_bounds, even_odd))
         mapper._raster_bitmap = bitmap
         mapper._raster_sub = cached_sub
         mapper.compute()
         results[Path(fp).stem] = mapper
 
     if missing_raster:
-        raise CacheMissError(missing_raster, kind="raster cache")
+        raise CacheMissError(missing_raster, kind="raster cache",
+                             expected=[str(ctx.raster_path(fp, file_hashes[fp],
+                                                           effective[fp]).name)
+                                       for fp in missing_raster])
 
     return results

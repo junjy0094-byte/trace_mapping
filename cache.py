@@ -15,7 +15,7 @@ import numpy as np
 from pathlib import Path
 from typing import Tuple
 
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 CACHE_DIRNAME = ".trace_cache"
 
 
@@ -57,19 +57,27 @@ def _raster_cache_path(filepath: str, file_hash: str, params_hash: str,
 
 def _save_raster_cache(path: Path, bitmap: np.ndarray,
                        bounds: Tuple[float, float, float, float],
-                       sub: int = 0) -> None:
+                       sub=(0, 0)) -> None:
+    """`sub` is (sub_x, sub_y), the per-axis sub-pixels per grid cell.
+
+    The two differ whenever the cells are not square, which is what keeps
+    the sub-pixels themselves square. A scalar is accepted and taken to
+    mean both axes.
+    """
+    if not isinstance(sub, (tuple, list, np.ndarray)):
+        sub = (sub, sub)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         path,
         version=np.int32(CACHE_VERSION),
         bitmap=bitmap.astype(np.uint8),
         bounds=np.array(bounds, dtype=np.float64),
-        sub=np.int32(sub),
+        sub=np.array([int(sub[0]), int(sub[1])], dtype=np.int32),
     )
 
 
 def _load_raster_cache(path: Path):
-    """Return (bitmap_bool, bounds_tuple, sub_int) or None if missing/corrupt."""
+    """Return (bitmap_bool, bounds_tuple, (sub_x, sub_y)) or None."""
     if not path.exists():
         return None
     try:
@@ -78,7 +86,12 @@ def _load_raster_cache(path: Path):
                 return None
             bitmap = d['bitmap'].astype(bool)
             bounds = tuple(d['bounds'].tolist())
-            sub = int(d['sub']) if 'sub' in d else 0
+            if 'sub' in d:
+                raw = np.atleast_1d(d['sub']).astype(int).ravel()
+                sub = (int(raw[0]), int(raw[1])) if raw.size >= 2 \
+                    else (int(raw[0]), int(raw[0]))
+            else:
+                sub = (0, 0)
             return bitmap, bounds, sub
     except Exception as e:
         print(f"  Cache read failed ({path.name}): {e}")

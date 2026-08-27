@@ -272,7 +272,7 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
             raster_params_fp['x_edges'] = [round(float(v), 9) for v in x_edges]
             raster_params_fp['y_edges'] = [round(float(v), 9) for v in y_edges]
         bitmap = cached_bounds = None
-        cached_sub = 0
+        cached_sub = (0, 0)
         r_path = None
         if cache_enabled:
             f_hash = file_hashes.get(fp) or _file_identity_hash(fp)

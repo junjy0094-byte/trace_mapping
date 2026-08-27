@@ -99,7 +99,9 @@ def gui_main():
         row=1, column=0, padx=4, pady=2, sticky='e')
     disp_var = tk.StringVar(value="600")
     ttk.Entry(param_frame, textvariable=disp_var, width=8).grid(row=1, column=1, padx=4)
-    ttk.Label(param_frame, text="(left-panel raster, larger=sharper/slower)").grid(
+    ttk.Label(param_frame,
+              text="(raster across the board's longer axis; pixels stay "
+                   "square. larger=sharper/slower)").grid(
         row=1, column=2, columnspan=4, padx=4, pady=2, sticky='w')
 
     # ---- Custom grid (non-uniform cell edges from CSV) ----

@@ -105,9 +105,11 @@ def main():
              'Useful for removing outer board-outline polygons. (default: 0)')
     parser.add_argument(
         '--display-pixels', type=int, default=600, metavar='N',
-        help='Minimum sub-pixel raster size per axis for the left-panel '
-             'display (default: 600). Larger = sharper detail, slower '
-             '(cost ~quadratic). e.g. 1200, 2000, 4000.')
+        help='Minimum sub-pixel raster size along the board\'s longer axis '
+             'for the left-panel display (default: 600). The shorter axis '
+             'is sized from it so sub-pixels stay square whatever the board '
+             'aspect ratio. Larger = sharper detail, slower (cost '
+             '~quadratic). e.g. 1200, 2000, 4000.')
     parser.add_argument(
         '--no-cache', action='store_true',
         help='Disable reuse of cached sub-pixel rasters. By default, the '

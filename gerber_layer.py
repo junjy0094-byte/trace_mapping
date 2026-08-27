@@ -14,6 +14,12 @@ guessing via an even-odd raster overlap count. See
 _resolve_copper_from_primitives() for the algorithm. The even-odd raster
 heuristic (TraceGridMapper(even_odd=True)) remains available as a legacy
 fallback.
+
+Every step of that resolution is spatially indexed and scales close to
+O(n log n): region nesting via batched STRtree containment, the polarity
+fold via a closed form that never builds a whole-layer accumulator, and
+every union via _union_all(), which unions each disjoint cluster on its
+own instead of overlaying the layer as one problem.
 """
 
 import numpy as np
@@ -243,17 +249,209 @@ def _primitive_polarity(prim):
     return 'clear' if getattr(prim, 'level_polarity', 'dark') == 'clear' else 'dark'
 
 
+def _union_all(geoms):
+    """Union a list of geometries, unioning each connected cluster alone.
+
+    GEOS's cascaded `unary_union` overlays the whole input as one problem,
+    which grows steeply superlinearly: on a 92k-polygon layer it dominates
+    everything else in this module. But a copper layer is not one problem
+    -- it is thousands of separate nets, pads and pour islands that cannot
+    possibly interact. Geometries whose bounding boxes are disjoint are
+    themselves disjoint, so we split the input into bounding-box connected
+    components (one batched STRtree self-query plus union-find), union each
+    component on its own, and assemble the results directly into a
+    MultiPolygon. No overlay is needed between components because they
+    provably do not overlap or touch.
+
+    Exactly equivalent to unary_union(geoms), and typically one to two
+    orders of magnitude faster on real layers. Falls back to plain
+    unary_union whenever the input is one single cluster or anything
+    unexpected turns up.
+    """
+    from shapely.ops import unary_union
+
+    if not geoms:
+        return None
+    if len(geoms) == 1:
+        return geoms[0]
+    try:
+        return _union_by_component(geoms)
+    except Exception:
+        return unary_union(geoms)
+
+
+def _bbox_components(geoms):
+    """Group indices of `geoms` into bounding-box connected components.
+
+    Returns a list of index lists. Two geometries land in the same group
+    only if their bounding boxes intersect (directly or transitively), so
+    geometries in different groups are guaranteed disjoint.
+    """
+    from shapely.strtree import STRtree
+
+    n = len(geoms)
+    left, right = STRtree(geoms).query(geoms)
+    upper = left < right          # each unordered pair once, self-pairs dropped
+    left, right = left[upper], right[upper]
+
+    parent = list(range(n))
+
+    def find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:   # path compression
+            parent[x], x = root, parent[x]
+        return root
+
+    for i, j in zip(left.tolist(), right.tolist()):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return list(groups.values())
+
+
+def _union_by_component(geoms):
+    """Component-wise implementation of _union_all()."""
+    from shapely.geometry import MultiPolygon, Polygon
+    from shapely.ops import unary_union
+
+    groups = _bbox_components(geoms)
+    if len(groups) == 1:
+        return unary_union(geoms)
+
+    parts = []
+    for idxs in groups:
+        merged = (unary_union([geoms[k] for k in idxs]) if len(idxs) > 1
+                  else geoms[idxs[0]])
+        if merged.is_empty:
+            continue
+        if isinstance(merged, Polygon):
+            parts.append(merged)
+        elif isinstance(merged, MultiPolygon):
+            parts.extend(p for p in merged.geoms if not p.is_empty)
+        else:
+            # Degenerate/mixed output (lines, collections): let GEOS decide.
+            raise TypeError(f"unexpected union result {merged.geom_type}")
+
+    if not parts:
+        return unary_union(geoms)
+    return MultiPolygon(parts) if len(parts) > 1 else parts[0]
+
+
 def _resolve_region_group(polys):
     """Resolve one Gerber region block's sub-contours by nesting containment.
 
     pcb-tools splits a single multi-contour G36/G37 region (contours
     separated by D02 moves) into several consecutive Region primitives
     that share one polarity. Per the Gerber spec, a contour nested inside
-    the already-accumulated result is a hole in it; anything else is
-    additional solid area. Using real polygon containment -- rather than a
-    rasterised even-odd guess -- resolves this exactly, including
-    multi-level nesting (island-in-hole-in-solid).
+    another is a hole in it; anything else is additional solid area.
+    Using real polygon containment -- rather than a rasterised even-odd
+    guess -- resolves this exactly, including multi-level nesting
+    (island-in-hole-in-solid).
+
+    A point is copper iff its *deepest* enclosing contour sits at an even
+    nesting depth, so the group resolves to
+
+        union over even-depth contours of (contour - its direct children)
+
+    Every boolean operation there is local: a contour against the handful
+    of contours immediately inside it. The nesting depths themselves come
+    from one batched STRtree containment query, so the whole group costs
+    O(n log n) instead of the O(n^2) of folding each contour into a
+    single accumulator that grows to the size of the entire layer.
     """
+    n = len(polys)
+    if n == 1:
+        return polys[0]
+    try:
+        return _resolve_region_group_indexed(polys)
+    except Exception:
+        # Any STRtree/predicate incompatibility falls back to the
+        # original sequential fold, which is slow but dependency-light.
+        return _resolve_region_group_sequential(polys)
+
+
+def _nesting_depths(polys):
+    """Nesting depth and direct parent of each polygon in `polys`.
+
+    Returns (depth, parent) int arrays. depth[i] is the number of other
+    polygons in the list that contain polygon i; parent[i] is the index
+    of the smallest such container (-1 when top level).
+
+    Containment is tested with one batched STRtree query of every
+    polygon's representative point (guaranteed interior, so boundary
+    touching is not ambiguous). Mutually-containing duplicates are broken
+    by (area, index) ordering so the relation stays a strict partial
+    order and depths remain well defined.
+    """
+    from shapely.strtree import STRtree
+
+    n = len(polys)
+    pts = np.empty(n, dtype=object)
+    for i, p in enumerate(polys):
+        pts[i] = p.representative_point()
+    areas = np.array([p.area for p in polys], dtype=np.float64)
+
+    # STRtree evaluates the predicate as input.predicate(tree_geometry),
+    # so 'within' asks point-i-inside-polygon-j -- one vectorised sweep
+    # instead of n^2 point-in-polygon tests.
+    tree = STRtree(polys)
+    inner_idx, outer_idx = tree.query(pts, predicate='within')
+
+    depth = np.zeros(n, dtype=np.int64)
+    parent = np.full(n, -1, dtype=np.int64)
+    parent_area = np.full(n, np.inf, dtype=np.float64)
+
+    for inner, outer in zip(inner_idx.tolist(), outer_idx.tolist()):
+        if inner == outer:
+            continue
+        a_out, a_in = areas[outer], areas[inner]
+        if a_out < a_in or (a_out == a_in and outer > inner):
+            continue  # not a genuine container under the tie-break order
+        depth[inner] += 1
+        if a_out < parent_area[inner]:
+            parent_area[inner] = a_out
+            parent[inner] = outer
+
+    return depth, parent
+
+
+def _resolve_region_group_indexed(polys):
+    """STRtree-indexed implementation of _resolve_region_group()."""
+    from shapely.ops import unary_union
+
+    depth, parent = _nesting_depths(polys)
+
+    children = [[] for _ in range(len(polys))]
+    for i, par in enumerate(parent.tolist()):
+        if par >= 0:
+            children[par].append(i)
+
+    pieces = []
+    for i, d in enumerate(depth.tolist()):
+        if d % 2:
+            continue  # odd depth == a hole; carved out by its parent
+        geom = polys[i]
+        kids = children[i]
+        if kids:
+            holes = unary_union([polys[c] for c in kids]) if len(kids) > 1 \
+                else polys[kids[0]]
+            geom = geom.difference(holes)
+        if not geom.is_empty:
+            pieces.append(geom)
+
+    if not pieces:
+        return polys[0].difference(polys[0])  # empty, same geometry type
+    return _union_all(pieces)
+
+
+def _resolve_region_group_sequential(polys):
+    """Original single-accumulator fold. Quadratic; fallback only."""
     ordered = sorted(polys, key=lambda p: p.area, reverse=True)
     result = ordered[0]
     for poly in ordered[1:]:
@@ -265,35 +463,85 @@ def _resolve_region_group(polys):
     return result
 
 
+def _build_polarity_runs(geoms, polarities):
+    """Collapse the primitive stream into maximal same-polarity runs.
+
+    Returns a list of (polarity, merged_geometry). Union/difference are
+    associative within one polarity, so merging a run up front is exact
+    and replaces many boolean ops with one cascaded union.
+    """
+    runs = []
+    for geom, polarity in zip(geoms, polarities):
+        if runs and runs[-1][0] == polarity:
+            runs[-1][1].append(geom)
+        else:
+            runs.append((polarity, [geom]))
+
+    return [(polarity, _union_all(group)) for polarity, group in runs]
+
+
 def _fold_polarity_runs(geoms, polarities):
     """Sequential dark=union / clear=difference fold, in file order.
 
     This is the painter's-algorithm rule the Gerber spec requires: later
-    primitives act on whatever came before them. Consecutive primitives
-    that share a polarity are batched into one unary_union before folding
-    into the accumulator -- algebraically identical to folding one at a
-    time (union/difference are associative within a single polarity run),
-    but with far fewer boolean ops.
+    primitives act on whatever came before them.
+
+    Folding literally -- acc = acc.union(dark) / acc.difference(clear),
+    run by run -- is quadratic: every one of the k runs re-processes an
+    accumulator that has grown to the size of the whole layer. Instead we
+    use the equivalent closed form: a dark run is only ever cut by the
+    clear runs that come *after* it, so
+
+        copper = union over dark runs Di of (Di - union of clears after Di)
+
+    Each difference now touches one run against the clears that actually
+    overlap its bounding box (found via an STRtree over the clear runs),
+    and the results combine in a single cascaded union.
     """
     from shapely.ops import unary_union
 
-    acc = None
-    run, run_polarity = [], None
+    if not geoms:
+        return None
 
-    def flush(acc):
-        if not run:
-            return acc
-        merged = unary_union(run) if len(run) > 1 else run[0]
-        if run_polarity == 'dark':
-            return merged if acc is None else acc.union(merged)
-        return acc if acc is None else acc.difference(merged)
+    # Fast path: nothing is cleared, so the whole layer is one union.
+    if not any(p == 'clear' for p in polarities):
+        return _union_all(geoms)
 
-    for geom, polarity in zip(geoms, polarities):
-        if polarity != run_polarity:
-            acc = flush(acc)
-            run, run_polarity = [], polarity
-        run.append(geom)
-    return flush(acc)
+    runs = _build_polarity_runs(geoms, polarities)
+
+    clear_positions, clear_geoms = [], []
+    for pos, (polarity, geom) in enumerate(runs):
+        if polarity == 'clear':
+            clear_positions.append(pos)
+            clear_geoms.append(geom)
+
+    tree = None
+    if clear_geoms:
+        try:
+            from shapely.strtree import STRtree
+            tree = STRtree(clear_geoms)
+        except Exception:
+            tree = None
+
+    pieces = []
+    for pos, (polarity, geom) in enumerate(runs):
+        if polarity != 'dark':
+            continue
+        if tree is not None:
+            cand = [c for c in tree.query(geom).tolist()
+                    if clear_positions[c] > pos]
+        else:
+            cand = [c for c, cpos in enumerate(clear_positions) if cpos > pos]
+        if cand:
+            cuts = unary_union([clear_geoms[c] for c in cand]) if len(cand) > 1 \
+                else clear_geoms[cand[0]]
+            geom = geom.difference(cuts)
+        if not geom.is_empty:
+            pieces.append(geom)
+
+    if not pieces:
+        return None
+    return _union_all(pieces)
 
 
 def _resolve_copper_from_primitives(polys, polarities, kinds):
@@ -308,8 +556,13 @@ def _resolve_copper_from_primitives(polys, polarities, kinds):
        whole file in order, 'dark' adding to the accumulated copper and
        'clear' cutting it out.
     """
+    n = len(polys)
+    verbose = n > 20000  # only worth narrating on layers big enough to wait on
+
+    t0 = time.time()
     collapsed_polys, collapsed_pols = [], []
-    i, n = 0, len(polys)
+    largest_group = 0
+    i = 0
     while i < n:
         if kinds[i] == 'region':
             j = i
@@ -317,6 +570,7 @@ def _resolve_copper_from_primitives(polys, polarities, kinds):
             while j < n and kinds[j] == 'region' and polarities[j] == polarities[i]:
                 group.append(polys[j])
                 j += 1
+            largest_group = max(largest_group, len(group))
             collapsed_polys.append(
                 _resolve_region_group(group) if len(group) > 1 else group[0])
             collapsed_pols.append(polarities[i])
@@ -326,7 +580,18 @@ def _resolve_copper_from_primitives(polys, polarities, kinds):
             collapsed_pols.append(polarities[i])
             i += 1
 
-    return _fold_polarity_runs(collapsed_polys, collapsed_pols)
+    if verbose:
+        n_clear = sum(1 for p in collapsed_pols if p == 'clear')
+        print(f"\n    region nesting: {n} -> {len(collapsed_polys)} primitives "
+              f"(largest region block: {largest_group}) in {time.time()-t0:.1f}s")
+        print(f"    polarity fold: {len(collapsed_polys)} primitives, "
+              f"{n_clear} clear ... ", end="", flush=True)
+
+    t1 = time.time()
+    merged = _fold_polarity_runs(collapsed_polys, collapsed_pols)
+    if verbose:
+        print(f"{time.time()-t1:.1f}s\n  total ", end="", flush=True)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -482,10 +747,19 @@ class GerberLayer:
                     skip_count += 1
                     continue
 
-                if geom is not None and not geom.is_valid:
-                    geom = geom.buffer(0)
+                if geom is None:
+                    skip_count += 1
+                    continue
 
-                if geom is not None and geom.is_valid and not geom.is_empty:
+                # is_valid walks every vertex, so ask once: repair only
+                # what actually needs repairing, and trust the repair.
+                if not geom.is_valid:
+                    geom = geom.buffer(0)
+                    if not geom.is_valid:
+                        skip_count += 1
+                        continue
+
+                if not geom.is_empty:
                     polys.append(geom)
                     polarities.append(_primitive_polarity(prim))
                     kinds.append(kind)
@@ -603,7 +877,7 @@ class GerberLayer:
             snapped = polys
 
         t0 = time.time()
-        merged = unary_union(snapped)
+        merged = _union_all(snapped)
         print(f"done ({time.time()-t0:.1f}s)")
         return merged
 
